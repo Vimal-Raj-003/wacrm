@@ -339,6 +339,11 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const config = configRows[0]
 
+      // Proof that Meta is actually reaching this server for this
+      // number — read back by the Verify Connection diagnostic and
+      // required for Campaign Ready.
+      await recordInboundEvent(config.account_id)
+
       const decryptedAccessToken = decrypt(config.access_token)
 
       for (let i = 0; i < value.messages.length; i++) {
@@ -408,6 +413,67 @@ function isValidStatusTransition(current: string, incoming: string): boolean {
   return ii > ci
 }
 
+/**
+ * Advance `last_outbound_test_status` when a status update belongs to
+ * the Send Test Template message. Ranked so a late `sent` can never
+ * demote a `delivered` that already arrived (Meta does not guarantee
+ * status ordering), and `failed` always wins so a failure is never
+ * hidden by an earlier success.
+ *
+ * Entirely best-effort: these columns arrive with migration 043, and on
+ * an un-migrated instance the update simply fails and is ignored. It
+ * must never affect inbound message processing.
+ */
+const OUTBOUND_TEST_RANK: Record<string, number> = {
+  accepted: 0,
+  sent: 1,
+  delivered: 2,
+  read: 3,
+}
+
+async function recordOutboundTestStatus(wamid: string, nextStatus: string) {
+  try {
+    const { data: rows, error } = await supabaseAdmin()
+      .from('whatsapp_config')
+      .select('account_id, last_outbound_test_status')
+      .eq('last_outbound_test_wamid', wamid)
+    // Un-migrated schema (42703) or no match — nothing to do.
+    if (error || !rows || rows.length === 0) return
+
+    for (const row of rows) {
+      const current = OUTBOUND_TEST_RANK[row.last_outbound_test_status ?? ''] ?? -1
+      const incoming = OUTBOUND_TEST_RANK[nextStatus] ?? -1
+      const isFailure = nextStatus === 'failed'
+      if (!isFailure && incoming <= current) continue
+      await supabaseAdmin()
+        .from('whatsapp_config')
+        .update({ last_outbound_test_status: nextStatus })
+        .eq('account_id', row.account_id)
+    }
+  } catch (err) {
+    // Debug, not warn: not applying is the normal case (no test in
+    // flight, or migration 043 not yet applied) and this must never
+    // look like a delivery problem in the logs.
+    console.debug('[webhook] outbound test status not recorded:', err)
+  }
+}
+
+/**
+ * Stamp `last_inbound_event_at` so "Meta is delivering events to this
+ * server" is an observation rather than an assumption. Best-effort for
+ * the same reason as above.
+ */
+async function recordInboundEvent(accountId: string) {
+  try {
+    await supabaseAdmin()
+      .from('whatsapp_config')
+      .update({ last_inbound_event_at: new Date().toISOString() })
+      .eq('account_id', accountId)
+  } catch (err) {
+    console.debug('[webhook] inbound event timestamp not recorded:', err)
+  }
+}
+
 async function handleStatusUpdate(status: {
   id: string
   status: string
@@ -453,6 +519,14 @@ async function handleStatusUpdate(status: {
   if (msgErr) {
     console.error('Error updating message status:', msgErr)
   }
+
+  // 1b) If this status belongs to the connection test sent from the
+  //     WhatsApp settings screen, record how far it actually got.
+  //     "Meta returned 200" only proves Meta accepted the message;
+  //     `delivered` is the part that proves it reached a handset, and
+  //     it only ever arrives here. Campaign Ready depends on it (see
+  //     src/lib/whatsapp/campaign-readiness.ts).
+  await recordOutboundTestStatus(status.id, status.status)
 
   // Webhook fan-out for this status change happens at the END of this
   // handler (after the broadcast mirror below), so a slow subscriber

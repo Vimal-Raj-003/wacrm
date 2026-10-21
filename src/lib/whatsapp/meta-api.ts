@@ -25,6 +25,35 @@ export interface MetaPhoneInfo {
   quality_rating?: string
 }
 
+/**
+ * The phone-number node fields that carry Meta's *authoritative*
+ * registration state, on top of the display metadata above.
+ *
+ * `platform_type` + `status` together answer "is this number already
+ * registered on the Cloud API", and `is_pin_enabled` answers "does a
+ * two-step verification PIN exist to send to /register". Deciding either
+ * question from a local timestamp instead is what made Save Configuration
+ * attempt a doomed /register on an already-live number — see
+ * `./registration-state.ts`.
+ *
+ * Verified present on v21.0 (the version pinned below) and v25.0.
+ */
+export interface MetaPhoneRegistrationInfo extends MetaPhoneInfo {
+  /** `CONNECTED`, `PENDING`, `BANNED`, `RESTRICTED`, … */
+  status?: string
+  /** `CLOUD_API`, `ON_PREMISE`, `NOT_APPLICABLE`. */
+  platform_type?: string
+  /** Whether a two-step verification PIN exists on this number. */
+  is_pin_enabled?: boolean
+  is_preverified_number?: boolean
+  code_verification_status?: string
+  name_status?: string
+  account_mode?: string
+  messaging_limit_tier?: string
+  throughput?: { level?: string }
+  last_onboarded_time?: string
+}
+
 interface MetaErrorResponse {
   error?: {
     message?: string
@@ -133,6 +162,113 @@ export async function verifyPhoneNumber(
   return response.json()
 }
 
+/**
+ * Field list for `getPhoneNumberRegistration`. Exported so the
+ * diagnostic report can state exactly what it asked Meta for.
+ */
+export const PHONE_REGISTRATION_FIELDS = [
+  'id',
+  'display_phone_number',
+  'verified_name',
+  'quality_rating',
+  'status',
+  'platform_type',
+  'code_verification_status',
+  'name_status',
+  'account_mode',
+  'is_pin_enabled',
+  'is_preverified_number',
+  'messaging_limit_tier',
+  'throughput',
+  'last_onboarded_time',
+] as const
+
+/**
+ * Read a phone number's full state, including whether Meta already has
+ * it registered on the Cloud API and whether a two-step verification
+ * PIN exists on it.
+ *
+ * This is the call that has to happen *before* deciding to register
+ * anything. `verifyPhoneNumber` above stays as-is (four display fields)
+ * because every existing caller only wants the name and quality rating.
+ */
+export async function getPhoneNumberRegistration(
+  args: VerifyPhoneNumberArgs,
+): Promise<MetaPhoneRegistrationInfo> {
+  const { phoneNumberId, accessToken } = args
+  const url = `${META_API_BASE}/${phoneNumberId}?fields=${PHONE_REGISTRATION_FIELDS.join(',')}`
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  return response.json()
+}
+
+export interface TokenIdentity {
+  /** The Meta app the token was issued for. */
+  appId: string | null
+  appName: string | null
+  /** `SYSTEM_USER`, `USER`, `PAGE`, … */
+  tokenType: string | null
+  isValid: boolean
+  /** `expires_at === 0` — a permanent System User token. */
+  neverExpires: boolean
+  scopes: string[]
+}
+
+/**
+ * Introspect the access token to learn which app it belongs to and what
+ * it is allowed to do.
+ *
+ * Two uses: proving the token carries `whatsapp_business_management` and
+ * `whatsapp_business_messaging` before blaming a permission error on
+ * something else, and — more usefully — recovering OUR app id without a
+ * `META_APP_ID` env var, so "is the WABA subscribed to *this* app" can
+ * be answered by id match instead of the old "the list is non-empty, so
+ * it's probably us" guess. That guess is wrong whenever a WABA carries
+ * more than one subscriber, which is common.
+ *
+ * Returns `null` rather than throwing when the token cannot introspect
+ * itself — the app-id match then degrades to "unknown", which must never
+ * fail the surrounding diagnostic.
+ */
+export async function getAppIdFromToken(args: {
+  accessToken: string
+}): Promise<TokenIdentity | null> {
+  const { accessToken } = args
+  const encoded = encodeURIComponent(accessToken)
+  const url = `${META_API_BASE}/debug_token?input_token=${encoded}&access_token=${encoded}`
+  let response: Response
+  try {
+    response = await fetch(url, { headers: { Accept: 'application/json' } })
+  } catch {
+    return null
+  }
+  if (!response.ok) return null
+  const body = (await response.json().catch(() => null)) as {
+    data?: {
+      app_id?: string
+      application?: string
+      type?: string
+      is_valid?: boolean
+      expires_at?: number
+      scopes?: string[]
+    }
+  } | null
+  const d = body?.data
+  if (!d) return null
+  return {
+    appId: d.app_id ?? null,
+    appName: d.application ?? null,
+    tokenType: d.type ?? null,
+    isValid: d.is_valid === true,
+    neverExpires: d.expires_at === 0,
+    scopes: Array.isArray(d.scopes) ? d.scopes : [],
+  }
+}
+
 // ============================================================
 // Cloud API registration (subscription for inbound webhooks)
 // ============================================================
@@ -162,12 +298,28 @@ export interface RegisterPhoneNumberArgs {
   phoneNumberId: string
   accessToken: string
   /**
-   * 6-digit PIN the user set in Meta WhatsApp Manager →
-   * Two-step verification. If 2FA is not enabled on the number,
-   * Meta rejects /register with a clear error and the user is
-   * pointed at the right setting in the UI.
+   * 6-digit PIN from Meta WhatsApp Manager → Two-step verification.
+   *
+   * Optional, because it does not always exist. Meta is deprecating the
+   * 6-digit PIN for eligible Cloud API numbers, and a number that never
+   * had two-step verification enabled has no PIN either — in both cases
+   * Meta reports `is_pin_enabled: false` on the phone node and the
+   * parameter must be left out. Sending a value anyway is what produces
+   * `(#133005) Two-step verification PIN mismatch`, because there is
+   * nothing on Meta's side to compare it against.
+   *
+   * Callers should not decide this by hand: run
+   * `assessRegistration()` + `pinBodyFor()` from `./registration-state`,
+   * which read `is_pin_enabled` and omit or require the PIN accordingly.
+   * When Meta says a PIN is enabled, it is required and sent verbatim.
    */
-  pin: string
+  pin?: string
+  /**
+   * 2-letter ISO 3166 country code enabling local storage. Meta's docs
+   * note this cannot be changed or disabled afterwards without a
+   * deregister + re-register, so wacrm never sets it implicitly.
+   */
+  dataLocalizationRegion?: string
 }
 
 export interface RegisterPhoneNumberResult {
@@ -191,15 +343,23 @@ export interface RegisterPhoneNumberResult {
 export async function registerPhoneNumber(
   args: RegisterPhoneNumberArgs
 ): Promise<RegisterPhoneNumberResult> {
-  const { phoneNumberId, accessToken, pin } = args
+  const { phoneNumberId, accessToken, pin, dataLocalizationRegion } = args
   const url = `${META_API_BASE}/${phoneNumberId}/register`
+  // Build the body with only the parameters that apply. `pin` used to be
+  // interpolated unconditionally, so a number with no two-step
+  // verification PIN was sent `{"pin": undefined}` — JSON.stringify drops
+  // the key, but any value the form happened to hold went straight to
+  // Meta and came back as a 133005 mismatch.
+  const body: Record<string, unknown> = { messaging_product: 'whatsapp' }
+  if (typeof pin === 'string' && pin.trim()) body.pin = pin.trim()
+  if (dataLocalizationRegion) body.data_localization_region = dataLocalizationRegion
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${accessToken}`,
     },
-    body: JSON.stringify({ messaging_product: 'whatsapp', pin }),
+    body: JSON.stringify(body),
   })
 
   if (response.ok) {
@@ -316,6 +476,55 @@ export async function getSubscribedApps(
   }
   const data = (await response.json()) as { data?: SubscribedApp[] }
   return data.data ?? []
+}
+
+export interface WabaTemplateSummary {
+  id?: string
+  name: string
+  /** `APPROVED`, `PENDING`, `REJECTED`, `PAUSED`, `DISABLED`, … */
+  status?: string
+  /** Meta's language code, e.g. `en` — NOT always `en_US`. */
+  language?: string
+  category?: string
+}
+
+/**
+ * List a WABA's message templates straight from Meta.
+ *
+ * The local `message_templates` table can be stale or empty on a fresh
+ * install, so anything that has to answer "is there an approved
+ * template we are allowed to send" must ask Meta. Returns the summary
+ * fields only; `/api/whatsapp/templates/sync` remains the path that
+ * mirrors full component definitions into the database.
+ *
+ * Note the `language` field: Meta returns what the template was created
+ * with (commonly `en`), and sending with a mismatched language code
+ * fails, so callers must pass this value through rather than defaulting
+ * to `en_US`.
+ */
+export async function listMessageTemplates(args: {
+  wabaId: string
+  accessToken: string
+}): Promise<WabaTemplateSummary[]> {
+  const { wabaId, accessToken } = args
+  const out: WabaTemplateSummary[] = []
+  let url: string | undefined =
+    `${META_API_BASE}/${wabaId}/message_templates?fields=id,name,status,language,category&limit=100`
+  for (let page = 0; url && page < 5; page++) {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!response.ok) {
+      await throwMetaError(response, `Meta API error: ${response.status}`)
+    }
+    const data = (await response.json()) as {
+      data?: WabaTemplateSummary[]
+      paging?: { next?: string }
+    }
+    out.push(...(data.data ?? []))
+    url = data.paging?.next
+  }
+  return out
 }
 
 // ============================================================

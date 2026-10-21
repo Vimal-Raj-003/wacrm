@@ -57,8 +57,29 @@ type WabaSubscription = {
   checked: boolean;
   subscribed: boolean | null;
   app_id_match: boolean | null;
+  app_id?: string | null;
+  subscribed_app_ids?: string[];
   error?: string;
 };
+
+/**
+ * Meta's own verdict on the number, returned by every config endpoint.
+ * `pin_requirement` is what decides whether the PIN box is shown at
+ * all: `not_set` means Meta reports no two-step verification PIN on the
+ * number (never enabled, or in Meta's 2026 PIN-deprecation cohort), and
+ * sending one is what produced "The two-step verification PIN is wrong"
+ * on a number that was already live.
+ */
+type RegistrationInfo = {
+  registered: boolean;
+  registration_required?: boolean;
+  pin_requirement: 'required' | 'not_set' | 'unknown';
+  pin_deprecation_eligible?: boolean;
+  summary: string;
+  blockers?: string[];
+};
+
+type CheckState = 'pass' | 'fail' | 'unknown';
 
 export function WhatsAppConfig() {
   const t = useTranslations('Settings.whatsapp');
@@ -119,25 +140,69 @@ export function WhatsAppConfig() {
   // in the row). When false, the saved config is metadata-only and
   // Meta will silently drop every inbound event — that's the
   // multi-number bug that prompted this work.
-  const isRegistered = Boolean(config?.registered_at);
   const lastRegistrationError = config?.last_registration_error ?? null;
 
   const [verifyingRegistration, setVerifyingRegistration] = useState(false);
   type RegistrationProbe = {
     live: boolean;
+    campaign_ready?: boolean;
+    campaign_ready_checks?: Record<string, CheckState>;
+    campaign_ready_blockers?: string[];
     checks: Record<string, boolean | null>;
     errors?: string[];
+    registration?: RegistrationInfo | null;
     last_registration_error?: string | null;
     registered_at?: string | null;
     subscribed_apps_at?: string | null;
+    migration_pending?: boolean;
   };
   const [registrationProbe, setRegistrationProbe] =
     useState<RegistrationProbe | null>(null);
+
+  // Meta's registration verdict, refreshed by every action. Drives both
+  // the Register Number button's availability and whether a PIN box is
+  // shown — a PIN is never asked for unless Meta says one exists.
+  const [registration, setRegistration] = useState<RegistrationInfo | null>(null);
+
+  // The three mutating actions, each with its own in-flight flag so one
+  // spinner can't imply another action is running.
+  const [registering, setRegistering] = useState(false);
+  const [subscribing, setSubscribing] = useState(false);
+  const [sendingTest, setSendingTest] = useState(false);
+
+  // Send Test Template inputs.
+  const [testRecipient, setTestRecipient] = useState('');
+  const [testTemplate, setTestTemplate] = useState('');
+  const [approvedTemplates, setApprovedTemplates] = useState<
+    { name: string; language?: string; category?: string }[]
+  >([]);
+
+  // True when the API wrote the row but migration 043 is not applied, so
+  // the registration-state columns were dropped. Shown as a banner
+  // rather than silently reporting state that was never stored.
+  const [migrationPending, setMigrationPending] = useState(false);
 
   const webhookUrl =
     typeof window !== 'undefined'
       ? `${window.location.origin}/api/whatsapp/webhook`
       : '';
+
+  /**
+   * Load the APPROVED templates Meta will let this WABA send. Defined
+   * before `fetchConfig` because it appears in that callback's
+   * dependency array, which is evaluated at render time.
+   */
+  const loadApprovedTemplates = useCallback(async () => {
+    try {
+      const res = await fetch('/api/whatsapp/config/test-template', { method: 'GET' });
+      const data = await res.json();
+      const list = (data.templates ?? []) as { name: string; language?: string }[];
+      setApprovedTemplates(list);
+      setTestTemplate((current) => current || list[0]?.name || '');
+    } catch (err) {
+      console.error('could not load approved templates:', err);
+    }
+  }, []);
 
   const fetchConfig = useCallback(async (acctId: string) => {
     setLoading(true);
@@ -194,23 +259,29 @@ export function WhatsAppConfig() {
             setStatusMessage('');
             setStatusMeta(null);
             setWabaSubscription(payload.waba_subscription ?? null);
+            // Meta's own verdict on registration, read in the same call.
+            setRegistration(payload.registration ?? null);
           } else {
             setConnectionStatus('disconnected');
             setResetReason(payload.needs_reset ? 'token_corrupted' : payload.reason === 'meta_api_error' ? 'meta_api_error' : null);
             setStatusMessage(payload.message || '');
             setStatusMeta(payload.meta ?? null);
             setWabaSubscription(null);
+            setRegistration(null);
           }
         } catch (err) {
           console.error('Health check failed:', err);
           setConnectionStatus('disconnected');
         }
+        void loadApprovedTemplates();
       } else {
         setConnectionStatus('disconnected');
         setResetReason(null);
         setStatusMessage('');
         setStatusMeta(null);
         setWabaSubscription(null);
+        setRegistration(null);
+        setApprovedTemplates([]);
       }
     } catch (err) {
       console.error('fetchConfig error:', err);
@@ -218,7 +289,7 @@ export function WhatsAppConfig() {
     } finally {
       setLoading(false);
     }
-  }, [supabase, t]);
+  }, [supabase, t, loadApprovedTemplates]);
 
   useEffect(() => {
     // Need both the auth session (`!authLoading`) AND the profile
@@ -285,14 +356,14 @@ export function WhatsAppConfig() {
       // the access_token server-side with ENCRYPTION_KEY. Skipping this
       // and writing direct to Supabase stores the token in plaintext,
       // which then fails decryption on every subsequent health check.
+      // No PIN here, deliberately. Saving credentials is a save — it no
+      // longer attempts POST /{phone_number_id}/register, so there is
+      // nothing for a PIN to be used for. Registration is its own
+      // action, and it asks for a PIN only when Meta reports one exists.
       const payload: Record<string, unknown> = {
         phone_number_id: phoneNumberId.trim(),
         waba_id: wabaId.trim() || null,
         verify_token: verifyToken.trim() || null,
-        // Optional — only sent when the user filled it in. The server
-        // requires it on first save or when changing numbers; for a
-        // simple token rotation, leaving it blank skips re-register.
-        pin: pin.trim() || null,
       };
 
       if (tokenEdited && accessToken !== MASKED_TOKEN && accessToken.trim()) {
@@ -328,43 +399,19 @@ export function WhatsAppConfig() {
         return;
       }
       setSaveFailure(null);
+      setMigrationPending(Boolean(data.migration_pending));
 
-      // The route now returns a structured outcome:
-      //   * registered=true   → number is live, events will flow
-      //   * registered=false  → credentials saved but /register
-      //                         failed; UI shows the specific error
-      //                         and a retry path. registration_error
-      //                         is human-readable from Meta.
-      if (data.registered === false && data.registration_error) {
-        setSaveFailure({
-          message: `Saved, but Meta couldn't register the number: ${data.registration_error}`,
-          meta: data.meta ?? null,
-        });
-        toast.error(
-          t('savedButRegistrationFailed', { error: data.registration_error }),
-          { duration: 12000 },
-        );
-      } else if (data.registration_skipped) {
-        // Credentials saved + verified, but /register was skipped
-        // because no PIN was supplied (e.g. a Meta test number).
-        // Don't claim the number is "Live" — point at the
-        // Registration status banner instead.
-        toast.success(
-          t('savedRegistrationSkipped'),
-          { duration: 10000 },
-        );
-        setPin('');
-      } else {
-        toast.success(
-          data.phone_info?.verified_name
-            ? t('liveWithName', { name: data.phone_info.verified_name })
-            : t('connectedGeneric'),
-        );
-        // Clear the PIN so subsequent saves don't accidentally
-        // re-register (which would void the active subscription if
-        // the PIN became stale).
-        setPin('');
+      // The route saves and reports; it no longer registers or
+      // subscribes, so a save can never fail because of a PIN and can
+      // never flip a working channel to 'disconnected'.
+      if (data.registration) {
+        setRegistration(data.registration as RegistrationInfo);
       }
+      toast.success(
+        data.phone_info?.verified_name
+          ? t('savedWithName', { name: data.phone_info.verified_name })
+          : t('savedGeneric'),
+      );
 
       if (accountId) await fetchConfig(accountId);
     } catch (err) {
@@ -418,7 +465,11 @@ export function WhatsAppConfig() {
       });
       const data = (await res.json()) as RegistrationProbe;
       setRegistrationProbe(data);
-      if (data.live) {
+      setMigrationPending(Boolean(data.migration_pending));
+      if (data.registration) setRegistration(data.registration);
+      if (data.campaign_ready) {
+        toast.success(t('campaignReadyToast'));
+      } else if (data.live) {
         toast.success(t('fullyWired'));
       } else {
         toast.error(
@@ -432,6 +483,130 @@ export function WhatsAppConfig() {
       toast.error(t('verifyEndpointUnreachable'));
     } finally {
       setVerifyingRegistration(false);
+    }
+  }
+
+  /**
+   * "Register Number". The server reads Meta's state first and makes no
+   * call at all when the number is already live, so this is safe to
+   * click on a working production number. A PIN is only sent when Meta
+   * reports two-step verification is actually enabled.
+   */
+  async function handleRegisterNumber() {
+    setRegistering(true);
+    try {
+      const res = await fetch('/api/whatsapp/config/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: pin.trim() || null }),
+      });
+      const data = await res.json();
+      setMigrationPending(Boolean(data.migration_pending));
+
+      if (!res.ok) {
+        setSaveFailure({ message: data.error || t('registerFailed'), meta: data.meta ?? null });
+        toast.error(data.error || t('registerFailed'), { duration: 12000 });
+        return;
+      }
+      setSaveFailure(null);
+      if (data.registration) setRegistration(data.registration as RegistrationInfo);
+
+      if (data.called_register === false) {
+        // Nothing was touched — Meta already had it registered.
+        toast.success(t('alreadyRegisteredToast'), { duration: 9000 });
+      } else if (data.registration?.registered) {
+        toast.success(t('registerSucceeded'), { duration: 9000 });
+      } else {
+        toast.success(t('registerAcceptedNotLiveYet'), { duration: 10000 });
+      }
+      setPin('');
+      if (accountId) await fetchConfig(accountId);
+    } catch (err) {
+      console.error('register failed:', err);
+      toast.error(t('registerFailed'));
+    } finally {
+      setRegistering(false);
+    }
+  }
+
+  /** "Subscribe Webhooks" — POST /{waba_id}/subscribed_apps, explicitly. */
+  async function handleSubscribeWebhooks() {
+    setSubscribing(true);
+    try {
+      const res = await fetch('/api/whatsapp/config/subscribe-webhooks', {
+        method: 'POST',
+      });
+      const data = await res.json();
+      setMigrationPending(Boolean(data.migration_pending));
+
+      if (!res.ok) {
+        setSaveFailure({ message: data.error || t('subscribeFailed'), meta: data.meta ?? null });
+        toast.error(data.error || t('subscribeFailed'), { duration: 12000 });
+        return;
+      }
+      setSaveFailure(null);
+      const others: string[] = data.other_subscribed_app_ids ?? [];
+      if (others.length > 0) {
+        // Legal and often intentional, but every subscriber gets the
+        // same inbound events — worth saying out loud.
+        toast.success(
+          t('subscribedWithOthers', { count: others.length, ids: others.join(', ') }),
+          { duration: 12000 },
+        );
+      } else {
+        toast.success(t('subscribeSucceeded'));
+      }
+      if (accountId) await fetchConfig(accountId);
+    } catch (err) {
+      console.error('subscribe-webhooks failed:', err);
+      toast.error(t('subscribeFailed'));
+    } finally {
+      setSubscribing(false);
+    }
+  }
+
+  /**
+   * "Send Test Template" — delivers one approved template to a number
+   * the operator types, so Campaign Ready rests on an observed delivery
+   * rather than on the API having returned 200.
+   */
+  async function handleSendTestTemplate() {
+    if (!testRecipient.trim()) {
+      toast.error(t('testRecipientRequired'));
+      return;
+    }
+    if (!testTemplate) {
+      toast.error(t('testTemplateRequired'));
+      return;
+    }
+    setSendingTest(true);
+    try {
+      const chosen = approvedTemplates.find((x) => x.name === testTemplate);
+      const res = await fetch('/api/whatsapp/config/test-template', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: testRecipient.trim(),
+          template_name: testTemplate,
+          language: chosen?.language,
+        }),
+      });
+      const data = await res.json();
+      setMigrationPending(Boolean(data.migration_pending));
+
+      if (!res.ok) {
+        setSaveFailure({ message: data.error || t('testSendFailed'), meta: data.meta ?? null });
+        toast.error(data.error || t('testSendFailed'), { duration: 12000 });
+        return;
+      }
+      setSaveFailure(null);
+      toast.success(t('testSendAccepted', { wamid: data.wamid }), { duration: 12000 });
+      if (accountId) await fetchConfig(accountId);
+    } catch (err) {
+      console.error('test-template failed:', err);
+      toast.error(t('testSendFailed'));
+    } finally {
+      setSendingTest(false);
     }
   }
 
@@ -491,6 +666,26 @@ export function WhatsAppConfig() {
   }
 
   const showResetBanner = resetReason === 'token_corrupted';
+
+  // Registration is whatever Meta says, with the local timestamp only
+  // as a fallback for a row saved before this screen read Meta's state.
+  // The local column alone was the original bug: it records whether
+  // wacrm ever ran /register, not whether the number is live.
+  const metaRegistered =
+    registration?.registered ?? Boolean(config?.registered_at);
+
+  // Campaign Ready comes only from a verification run that passed every
+  // check, or from the stamp such a run left on the row. Never derived
+  // from "credentials are valid".
+  const isCampaignReady =
+    registrationProbe?.campaign_ready ??
+    Boolean((config as { campaign_ready_at?: string | null } | null)?.campaign_ready_at);
+
+  // Only ask for a PIN when Meta says one exists. `not_set` means there
+  // is nothing to type, and typing something is what produced error
+  // 133005 on an already-registered number.
+  const pinNeeded = registration?.pin_requirement === 'required';
+  const pinUnknown = registration?.pin_requirement === 'unknown' || !registration;
 
   // Step + code + trace id in small muted text, so a user can quote
   // them to Meta support (issue #505). The step names are wire values
@@ -622,34 +817,65 @@ export function WhatsAppConfig() {
           {connectionStatus !== 'connected' && statusMeta && renderMetaDetails(statusMeta)}
         </Alert>
 
-        {/* Registration Status — the "is it actually live?" check.
-            Credentials being valid is necessary but not sufficient;
-            without a successful /register call the number won't
-            receive inbound events. Surface this dimension separately
-            so users don't trust a misleading green banner. */}
+        {/* Migration 043 not applied — the API had to drop the columns
+            that hold Meta's reported state, so say so rather than
+            report state that was never stored. */}
+        {migrationPending && (
+          <Alert className="bg-amber-950/40 border-amber-600/40">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="size-5 text-amber-400 mt-0.5 shrink-0" />
+              <div className="flex-1">
+                <AlertTitle className="text-amber-200 mb-1">{t('migrationPendingTitle')}</AlertTitle>
+                <AlertDescription className="text-amber-100/80 text-sm">
+                  {t('migrationPendingDesc')}
+                </AlertDescription>
+              </div>
+            </div>
+          </Alert>
+        )}
+
+        {/* Channel status — three independent dimensions, because any
+            one of them can be the reason nothing works:
+              1. credentials valid      (the banner above)
+              2. registered on Meta     (Meta's platform_type + status)
+              3. webhooks subscribed    (our app id in subscribed_apps)
+            Campaign Ready is the conjunction of all of them plus an
+            observed delivery in each direction. It is never inferred
+            from a green "connected" banner. */}
         {config && (
           <Alert
             className={
-              isRegistered
+              isCampaignReady
                 ? 'bg-emerald-950/30 border-emerald-700/50'
-                : 'bg-amber-950/30 border-amber-700/50'
+                : metaRegistered
+                  ? 'bg-sky-950/30 border-sky-700/50'
+                  : 'bg-amber-950/30 border-amber-700/50'
             }
           >
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2">
-                {isRegistered ? (
+                {isCampaignReady ? (
                   <CheckCircle2 className="size-4 text-emerald-400" />
+                ) : metaRegistered ? (
+                  <CheckCircle2 className="size-4 text-sky-400" />
                 ) : (
                   <AlertTriangle className="size-4 text-amber-400" />
                 )}
                 <AlertTitle
                   className={
-                    'mb-0 ' + (isRegistered ? 'text-emerald-200' : 'text-amber-200')
+                    'mb-0 ' +
+                    (isCampaignReady
+                      ? 'text-emerald-200'
+                      : metaRegistered
+                        ? 'text-sky-200'
+                        : 'text-amber-200')
                   }
                 >
-                  {isRegistered
-                    ? t('registered')
-                    : t('notRegistered')}
+                  {isCampaignReady
+                    ? t('campaignReady')
+                    : metaRegistered
+                      ? t('registeredNotCampaignReady')
+                      : t('notRegistered')}
                 </AlertTitle>
               </div>
               <Button
@@ -664,47 +890,62 @@ export function WhatsAppConfig() {
                 ) : (
                   <Zap className="size-3.5" />
                 )}
-                {t('verifyWithMeta')}
+                {t('verifyConnection')}
               </Button>
             </div>
             <AlertDescription className="text-muted-foreground mt-2 text-xs leading-relaxed">
-              {isRegistered ? (
-                <span
-                  dangerouslySetInnerHTML={{
-                    __html: t('subscribedSince', {
+              {/* Meta's own words about the number, which is what the
+                  decision was actually made from. */}
+              {registration?.summary
+                ? registration.summary
+                : metaRegistered
+                  ? t('subscribedSince', {
                       date: config.registered_at
                         ? new Date(config.registered_at).toLocaleString()
                         : t('unknownDate'),
-                    }),
-                  }}
-                />
-              ) : lastRegistrationError ? (
-                <>
-                  {t('lastAttemptFailed')}
-                  <span className="text-red-300">
-                    &quot;{lastRegistrationError}&quot;
-                  </span>
-                  . {t('retryHint')}
-                </>
-              ) : (
-                <>{t('noRegistrationHint')}</>
-              )}
+                    }).replace(/<[^>]+>/g, '')
+                  : lastRegistrationError
+                    ? `${t('lastAttemptFailed')}"${lastRegistrationError}"`
+                    : t('noRegistrationHint')}
             </AlertDescription>
+
+            {/* Meta reports no two-step PIN on this number. Saying so
+                explicitly is the whole point: it is why the old PIN box
+                could never produce anything but "the PIN is wrong". */}
+            {registration?.pin_requirement === 'not_set' && (
+              <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                {t('pinNotSetOnNumber')}
+              </p>
+            )}
 
             {registrationProbe && (
               <div className="mt-3 rounded border border-border bg-card/60 px-3 py-2 space-y-1.5 text-[11px]">
                 <p className="font-medium text-foreground">
                   {t('diagnosticLastRun')}
-                  <span className={registrationProbe.live ? 'text-emerald-400' : 'text-amber-400'}>
-                    {registrationProbe.live ? t('live') : t('notLive')}
+                  <span
+                    className={
+                      registrationProbe.campaign_ready
+                        ? 'text-emerald-400'
+                        : registrationProbe.live
+                          ? 'text-sky-400'
+                          : 'text-amber-400'
+                    }
+                  >
+                    {registrationProbe.campaign_ready
+                      ? t('campaignReady')
+                      : registrationProbe.live
+                        ? t('live')
+                        : t('notLive')}
                   </span>
                 </p>
                 <ul className="space-y-0.5 text-muted-foreground">
-                  {Object.entries(registrationProbe.checks).map(([k, v]) => (
+                  {Object.entries(
+                    registrationProbe.campaign_ready_checks ?? registrationProbe.checks,
+                  ).map(([k, v]) => (
                     <li key={k} className="flex items-center gap-1.5">
-                      {v === true ? (
+                      {v === true || v === 'pass' ? (
                         <CheckCircle2 className="size-3 text-emerald-400 shrink-0" />
-                      ) : v === false ? (
+                      ) : v === false || v === 'fail' ? (
                         <XCircle className="size-3 text-red-400 shrink-0" />
                       ) : (
                         <span className="size-3 rounded-full border border-border shrink-0" />
@@ -713,6 +954,13 @@ export function WhatsAppConfig() {
                     </li>
                   ))}
                 </ul>
+                {(registrationProbe.campaign_ready_blockers ?? []).length > 0 && (
+                  <ul className="pt-1 space-y-0.5 text-amber-300">
+                    {registrationProbe.campaign_ready_blockers?.map((b, i) => (
+                      <li key={i}>• {b}</li>
+                    ))}
+                  </ul>
+                )}
                 {(registrationProbe.errors ?? []).length > 0 && (
                   <ul className="pt-1 space-y-0.5 text-red-300">
                     {registrationProbe.errors?.map((e, i) => (
@@ -801,28 +1049,172 @@ export function WhatsAppConfig() {
               </p>
             </div>
 
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">
-                {t('twoStepPin')}
-                <span className="ml-1 text-muted-foreground">{t('optional')}</span>
-              </Label>
-              <Input
-                type="text"
-                inputMode="numeric"
-                maxLength={6}
-                placeholder={t('pinPlaceholder')}
-                value={pin}
-                onChange={(e) =>
-                  setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                }
-                className="bg-muted border-border text-foreground placeholder:text-muted-foreground tracking-widest"
-              />
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                <span dangerouslySetInnerHTML={{ __html: t('pinHint') }} />
-              </p>
-            </div>
           </CardContent>
         </Card>
+
+        {/* Channel actions — each Meta mutation behind its own button.
+            Save Configuration used to do all of this implicitly, which
+            is how a routine credential save ended up attempting a
+            registration it did not need and could not succeed at. */}
+        {config && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-foreground">{t('channelActionsTitle')}</CardTitle>
+              <CardDescription className="text-muted-foreground">
+                {t('channelActionsDesc')}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {/* --- Register Number --- */}
+              <div className="space-y-2 rounded-md border border-border p-3">
+                <p className="text-sm font-medium text-foreground">{t('registerNumber')}</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {metaRegistered ? t('registerNotNeeded') : t('registerNeeded')}
+                </p>
+
+                {/* The PIN box only exists when Meta reports a PIN on
+                    the number. Otherwise there is nothing to enter. */}
+                {(pinNeeded || pinUnknown) && !metaRegistered && (
+                  <div className="space-y-1.5 pt-1">
+                    <Label className="text-muted-foreground text-xs">
+                      {t('twoStepPin')}
+                      {pinUnknown && (
+                        <span className="ml-1 text-muted-foreground">{t('optional')}</span>
+                      )}
+                    </Label>
+                    <Input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      placeholder={t('pinPlaceholder')}
+                      value={pin}
+                      onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      className="bg-muted border-border text-foreground placeholder:text-muted-foreground tracking-widest"
+                    />
+                    <p className="text-xs text-muted-foreground leading-relaxed">
+                      {pinNeeded ? t('pinRequiredHint') : t('pinUnknownHint')}
+                    </p>
+                  </div>
+                )}
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRegisterNumber}
+                  disabled={registering || !canEditSettings}
+                  className="border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                >
+                  {registering ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" />
+                      {t('registering')}
+                    </>
+                  ) : (
+                    t('registerNumber')
+                  )}
+                </Button>
+              </div>
+
+              {/* --- Subscribe Webhooks --- */}
+              <div className="space-y-2 rounded-md border border-border p-3">
+                <p className="text-sm font-medium text-foreground">{t('subscribeWebhooks')}</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {t('subscribeWebhooksDesc')}
+                </p>
+                {wabaSubscription?.subscribed_app_ids &&
+                  wabaSubscription.subscribed_app_ids.length > 0 && (
+                    <p className="text-[11px] text-muted-foreground break-all">
+                      {t('subscribedAppIds')}:{' '}
+                      <code>{wabaSubscription.subscribed_app_ids.join(', ')}</code>
+                      {wabaSubscription.app_id && (
+                        <>
+                          {' · '}
+                          {t('thisApp')}: <code>{wabaSubscription.app_id}</code>
+                        </>
+                      )}
+                    </p>
+                  )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleSubscribeWebhooks}
+                  disabled={subscribing || !canEditSettings || !wabaId.trim()}
+                  className="border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                >
+                  {subscribing ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" />
+                      {t('subscribing')}
+                    </>
+                  ) : (
+                    t('subscribeWebhooks')
+                  )}
+                </Button>
+              </div>
+
+              {/* --- Send Test Template --- */}
+              <div className="space-y-2 rounded-md border border-border p-3">
+                <p className="text-sm font-medium text-foreground">{t('sendTestTemplate')}</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {t('sendTestTemplateDesc')}
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label className="text-muted-foreground text-xs">{t('testRecipient')}</Label>
+                    <Input
+                      placeholder={t('testRecipientPlaceholder')}
+                      value={testRecipient}
+                      onChange={(e) => setTestRecipient(e.target.value)}
+                      className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-muted-foreground text-xs">{t('testTemplate')}</Label>
+                    <select
+                      value={testTemplate}
+                      onChange={(e) => setTestTemplate(e.target.value)}
+                      className="h-9 w-full rounded-md border border-border bg-muted px-3 text-sm text-foreground"
+                    >
+                      {approvedTemplates.length === 0 && (
+                        <option value="">{t('noApprovedTemplates')}</option>
+                      )}
+                      {approvedTemplates.map((tpl) => (
+                        <option key={`${tpl.name}:${tpl.language}`} value={tpl.name}>
+                          {tpl.name}
+                          {tpl.language ? ` (${tpl.language})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleSendTestTemplate}
+                  disabled={
+                    sendingTest || !canEditSettings || approvedTemplates.length === 0
+                  }
+                  className="border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                >
+                  {sendingTest ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" />
+                      {t('sendingTest')}
+                    </>
+                  ) : (
+                    t('sendTestTemplate')
+                  )}
+                </Button>
+                {config.last_outbound_test_wamid && (
+                  <p className="text-[11px] text-muted-foreground break-all">
+                    {t('lastTestSend')}: <code>{config.last_outbound_test_wamid}</code> —{' '}
+                    {config.last_outbound_test_status ?? 'accepted'}
+                  </p>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Webhook URL */}
         <Card>

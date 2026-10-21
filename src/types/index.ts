@@ -311,6 +311,39 @@ export interface WhatsAppConfig {
   /** Last error from /register; cleared on success. */
   last_registration_error?: string;
   /**
+   * Meta's authoritative connection state, read from the phone-number
+   * node and persisted by migration 043. `meta_platform_type ===
+   * 'CLOUD_API'` together with `meta_status === 'CONNECTED'` is what
+   * actually means "registered" — `registered_at` above only records
+   * whether wacrm itself ever ran /register, which is NULL for any
+   * number registered through Embedded Signup or another tool.
+   */
+  meta_status?: string | null;
+  meta_platform_type?: string | null;
+  /**
+   * Meta's `is_pin_enabled`. `false` means no two-step verification PIN
+   * exists on the number, so /register must omit the pin parameter;
+   * sending one returns error 133005.
+   */
+  meta_pin_enabled?: boolean | null;
+  meta_onboarded_at?: string | null;
+  /** Meta app id the stored token belongs to, via /debug_token. */
+  meta_app_id?: string | null;
+  last_verified_at?: string | null;
+  /** Proof of a real outbound delivery (Send Test Template). */
+  last_outbound_test_at?: string | null;
+  last_outbound_test_wamid?: string | null;
+  /** `accepted` → `sent` → `delivered` → `read`, or `failed`. */
+  last_outbound_test_status?: string | null;
+  /** Proof that Meta is actually delivering events to this server. */
+  last_inbound_event_at?: string | null;
+  /**
+   * Set only by the verification endpoint, and only when every
+   * readiness check passed. NULL means not ready.
+   */
+  campaign_ready_at?: string | null;
+  campaign_ready_blockers?: string[] | null;
+  /**
    * When true (the default), the inbound webhook copies received media
    * into the `chat-media` bucket so attachments outlive Meta's ~30-day
    * retention. Turning it off keeps storage flat and accepts that
