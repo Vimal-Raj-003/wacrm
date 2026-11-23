@@ -11,16 +11,28 @@ import {
 import type { Conversation, Message, Contact, ConversationStatus } from "@/types";
 import { useRealtime } from "@/hooks/use-realtime";
 import { ConversationList } from "@/components/inbox/conversation-list";
+import { parseInboxFilter } from "@/lib/inbox/inbox-filters";
 import { MessageThread } from "@/components/inbox/message-thread";
 import { ContactSidebar } from "@/components/inbox/contact-sidebar";
 import { NewChatDialog } from "@/components/inbox/new-chat-dialog";
 import { toast } from "sonner";
 import { WifiOff } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  applyMessageUpdate,
+  applyRealtimeInsert,
+  mergeFetchedPage,
+  prependOlderMessages,
+} from "@/lib/inbox/optimistic-messages";
 
 // Remembers the agent's show/hide choice for the desktop contact panel
 // across reloads and sessions (device-scoped, like the theme prefs).
 const CONTACT_PANEL_STORAGE_KEY = "wacrm:inbox:contact-panel-open";
+
+// The width at which the contact panel fits beside the thread, matching the
+// `lg:` prefix on its wrapper below (Tailwind's `lg` is 64rem). Kept next to
+// the wrapper's breakpoint so the two can't quietly drift apart.
+const CONTACT_PANEL_MEDIA_QUERY = "(min-width: 64rem)";
 
 // `useSearchParams` (the `?c=<id>` deep link below) requires a Suspense
 // boundary or the production build bails to CSR and errors out. Thin
@@ -78,6 +90,23 @@ function InboxPageInner() {
     } catch {
       // localStorage can throw in private-browsing / sandboxed contexts.
     }
+  }, []);
+
+  /**
+   * Whether the viewport is wide enough to show the panel at all. The
+   * wrapper's `hidden lg:block` only hides it: below `lg` the sidebar still
+   * mounted and ran its deals / notes / tags fetches on every phone, for a
+   * panel nobody can see. Starts `true` to match the server render and
+   * reconciles after mount, for the same hydration reason as the flag above.
+   */
+  const [panelFits, setPanelFits] = useState(true);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia(CONTACT_PANEL_MEDIA_QUERY);
+    const apply = () => setPanelFits(mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
   }, []);
 
   const handleToggleContactPanel = useCallback(() => {
@@ -225,15 +254,7 @@ function InboxPageInner() {
           activeConversation &&
           newMsg.conversation_id === activeConversation.id
         ) {
-          setMessages((prev) => {
-            // Avoid duplicates
-            if (prev.some((m) => m.id === newMsg.id)) return prev;
-            // Replace optimistic message if it exists
-            const withoutOptimistic = prev.filter(
-              (m) => !m.id.startsWith("temp-")
-            );
-            return [...withoutOptimistic, newMsg];
-          });
+          setMessages((prev) => applyRealtimeInsert(prev, newMsg));
         }
 
         // Update conversation list preview. We need to know *synchronously*
@@ -518,8 +539,15 @@ function InboxPageInner() {
   }, [router]);
 
 
-  const handleMessagesLoaded = useCallback((loaded: Message[]) => {
-    setMessages(loaded);
+  const handleMessagesLoaded = useCallback(
+    (loaded: Message[], conversationId: string) => {
+      setMessages((prev) => mergeFetchedPage(prev, loaded, conversationId));
+    },
+    [],
+  );
+
+  const handleOlderMessagesLoaded = useCallback((older: Message[]) => {
+    setMessages((prev) => prependOlderMessages(prev, older));
   }, []);
 
   const handleNewMessage = useCallback((msg: Message) => {
@@ -531,9 +559,7 @@ function InboxPageInner() {
 
   const handleUpdateMessage = useCallback(
     (id: string, updates: Partial<Message>) => {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === id ? { ...m, ...updates } : m))
-      );
+      setMessages((prev) => applyMessageUpdate(prev, id, updates));
     },
     []
   );
@@ -596,7 +622,7 @@ function InboxPageInner() {
             thread can occupy the full width. Always visible on lg+. */}
         <div
           className={cn(
-            "flex h-full flex-1 lg:flex-none",
+            "flex h-full min-w-0 flex-1 lg:flex-none",
             hasActiveConv ? "hidden lg:flex" : "flex",
           )}
         >
@@ -607,6 +633,7 @@ function InboxPageInner() {
             onConversationsLoaded={handleConversationsLoaded}
             resyncToken={resyncToken}
             onNewChat={() => setNewChatOpen(true)}
+            initialFilter={parseInboxFilter(searchParams.get("filter"))}
           />
         </div>
 
@@ -631,6 +658,7 @@ function InboxPageInner() {
             contact={activeContact}
             messages={messages}
             onMessagesLoaded={handleMessagesLoaded}
+            onOlderMessagesLoaded={handleOlderMessagesLoaded}
             onNewMessage={handleNewMessage}
             onUpdateMessage={handleUpdateMessage}
             onStatusChange={handleStatusChange}
@@ -646,9 +674,9 @@ function InboxPageInner() {
 
         {/* Right panel: Contact sidebar — desktop only, and only when the
             agent hasn't collapsed it via the thread-header toggle (#258).
-            On mobile it's always hidden (the `lg:block` below), so the
+            Below `lg` it isn't rendered at all (`panelFits`), so the
             toggle — which is itself desktop-only — never affects it. */}
-        {contactPanelOpen && (
+        {contactPanelOpen && panelFits && (
           <div className="hidden lg:block">
             <ContactSidebar contact={activeContact} />
           </div>

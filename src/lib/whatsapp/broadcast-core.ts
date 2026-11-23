@@ -26,6 +26,10 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
+import {
+  isRetryableMetaError,
+  withTransientRetry,
+} from '@/lib/whatsapp/retry-policy';
 import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
@@ -73,6 +77,10 @@ export interface BroadcastPlan {
   rejected: number;
 }
 
+export interface CreatedBroadcastPlan extends BroadcastPlan {
+  duplicates: number;
+}
+
 const MAX_RECIPIENTS = 1000;
 
 /**
@@ -86,7 +94,7 @@ export async function createBroadcast(
   accountId: string,
   auditUserId: string,
   params: CreateBroadcastParams
-): Promise<BroadcastPlan> {
+): Promise<CreatedBroadcastPlan> {
   const { name, templateName, recipients } = params;
 
   if (!templateName) {
@@ -242,6 +250,7 @@ export async function createBroadcast(
     templateRow,
     planned,
     rejected,
+    duplicates: resolved.length - deduped.length,
   };
 }
 
@@ -269,15 +278,25 @@ export async function deliverBroadcast(
 
     for (const variant of variants) {
       try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
-        });
+        const result = await withTransientRetry(
+          () =>
+            sendTemplateMessage({
+              phoneNumberId: plan.phoneNumberId,
+              accessToken: plan.accessToken,
+              to: variant,
+              templateName: plan.templateName,
+              language: plan.templateLanguage,
+              template: plan.templateRow ?? undefined,
+              params: recipient.params,
+            }),
+          {
+            shouldRetry: (err) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              if (isRecipientNotAllowedError(msg)) return false;
+              return isRetryableMetaError(err);
+            },
+          },
+        );
         sentMessageId = result.messageId;
         lastError = null;
         break;

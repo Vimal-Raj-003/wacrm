@@ -14,6 +14,7 @@
  */
 
 import { MetaApiError } from './meta-api';
+import { extractTemplateVariables } from './template-validators';
 
 /** Automatic retry attempts after the initial try (total = 1 + MAX_AUTO_RETRIES). */
 export const MAX_AUTO_RETRIES = 2;
@@ -151,5 +152,102 @@ export async function withTransientRetry<T>(
       attempt++;
       await sleep(delay);
     }
+  }
+}
+
+/**
+ * Reconstruct the ordered body variable values from a persisted
+ * template message's rendered `content_text` by matching it against the
+ * template's `body_text` (supporting both positional `{{1}}` and named
+ * `{{customer_name}}` placeholders).
+ *
+ * Returns `[]` when the template has no variables, the ordered values
+ * array when matched, or `null` when the rendered text cannot be
+ * unambiguously matched back to the template.
+ */
+export function extractTemplateBodyParams(
+  templateBody: string,
+  renderedText: string | null | undefined,
+): string[] | null {
+  const keys = extractTemplateVariables(templateBody);
+  if (keys.length === 0) return [];
+  if (!renderedText) return null;
+
+  const placeholderRegex = /\{\{([A-Za-z0-9_]+)\}\}/g;
+  const occurrences: string[] = [];
+  let pattern = '^';
+  let lastIndex = 0;
+
+  for (const match of templateBody.matchAll(placeholderRegex)) {
+    const idx = match.index ?? 0;
+    const literal = templateBody.slice(lastIndex, idx);
+    pattern += literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    occurrences.push(match[1]);
+    pattern += '([\\s\\S]+?)';
+    lastIndex = idx + match[0].length;
+  }
+
+  const tail = templateBody.slice(lastIndex);
+  pattern += tail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  pattern += '$';
+
+  const re = new RegExp(pattern);
+  const matched = renderedText.match(re);
+  if (!matched) return null;
+
+  const byKey = new Map<string, string>();
+  occurrences.forEach((key, i) => {
+    const captured = matched[i + 1];
+    if (captured !== undefined && !byKey.has(key)) {
+      byKey.set(key, captured);
+    }
+  });
+
+  const out: string[] = [];
+  for (const key of keys) {
+    const val = byKey.get(key);
+    if (val === undefined) return null;
+    out.push(val);
+  }
+  return out;
+}
+
+/**
+ * Turn common Meta WhatsApp Cloud API messaging failure codes into
+ * clear, actionable text so the agent knows immediately WHY a send or
+ * retry failed.
+ */
+export function explainSendFailure(
+  code: number | null | undefined,
+  message: string,
+  details?: string | null,
+): string {
+  switch (code) {
+    case 131047:
+      return '24-hour customer service window expired (#131047) — send an approved WhatsApp template to start or reopen this chat.';
+    case 131026:
+      return 'Message undeliverable (#131026) — recipient number may not be registered on WhatsApp or has not accepted WhatsApp Terms.';
+    case 131049:
+      return 'Meta ecosystem engagement limit (#131049) — Meta temporarily capped marketing templates to this recipient; retry later or use a Utility template.';
+    case 131050:
+      return 'Customer opted out of marketing messages (#131050).';
+    case 131042:
+      return 'WhatsApp Business payment/billing issue (#131042) — check your Meta Business payment method.';
+    case 131031:
+      return 'WhatsApp Business Account is restricted or locked (#131031) — check Meta Business Manager.';
+    case 132000:
+      return 'Template parameter count mismatch (#132000) — check that all template variables match Meta’s approved template.';
+    case 132001:
+      return 'Template does not exist or is not approved in this language (#132001) — sync templates from Meta in Settings.';
+    case 132012:
+      return 'Template parameter format mismatch (#132012) — verify header media/PDF URL and variable values.';
+    case 130429:
+      return 'Meta API rate limit hit (#130429) — please retry in 1–2 minutes.';
+    case 131016:
+      return 'WhatsApp service temporarily unavailable (#131016) — please retry in 1–2 minutes.';
+    case 190:
+      return 'Meta access token expired or invalid (#190) — update your token in Settings → WhatsApp.';
+    default:
+      return details ? `${message} — ${details}` : message;
   }
 }

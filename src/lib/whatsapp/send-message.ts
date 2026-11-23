@@ -41,11 +41,13 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import { resolveContactSendTarget } from '@/lib/whatsapp/wa-identity';
+import { applyPendingMessageStatuses } from '@/lib/whatsapp/message-status-sync';
 import type { MessageTemplate } from '@/types';
 import {
   resolveTemplateRow,
   templateBodyParams,
   templateContentText,
+  templateHeaderMediaUrl,
 } from '@/lib/whatsapp/template-body';
 import {
   isRetryableMetaError,
@@ -91,6 +93,7 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  senderId?: string | null;
 }
 
 export interface SendMessageResult {
@@ -200,6 +203,7 @@ export async function sendMessageToConversation(
     filename,
     templateName,
     templateLanguage,
+    senderId,
     templateParams,
     templateMessageParams,
     interactivePayload,
@@ -486,28 +490,18 @@ export async function sendMessageToConversation(
           )
         : (contentText ?? null);
 
-  // For document/media-header templates, persist the header media URL on
-  // the message row so the sent PDF/media shows cleanly in chat history.
-  const templateHeaderMediaUrl =
-    messageType === 'template' &&
-    templateMessageParams &&
-    typeof templateMessageParams === 'object' &&
-    'headerMediaUrl' in templateMessageParams &&
-    typeof (templateMessageParams as { headerMediaUrl?: unknown }).headerMediaUrl ===
-      'string'
-      ? (templateMessageParams as { headerMediaUrl: string }).headerMediaUrl
-      : messageType === 'template' && templateRow?.header_media_url
-        ? templateRow.header_media_url
-        : null;
-
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
     .insert({
       conversation_id: conversationId,
       sender_type: 'agent',
+      sender_id: senderId ?? null,
       content_type: messageType,
       content_text: persistedText,
-      media_url: mediaUrl || templateHeaderMediaUrl || null,
+      media_url:
+        messageType === 'template'
+          ? templateHeaderMediaUrl(templateRow, templateMessageParams)
+          : mediaUrl || null,
       template_name: templateName || null,
       interactive_payload:
         messageType === 'interactive' ? interactivePayload : null,
@@ -526,6 +520,8 @@ export async function sendMessageToConversation(
       500
     );
   }
+
+  await applyPendingMessageStatuses(supabaseAdmin(), accountId, waMessageId);
 
   const lastMessageText =
     messageType === 'interactive'

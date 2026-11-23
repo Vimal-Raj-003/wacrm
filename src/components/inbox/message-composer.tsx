@@ -5,8 +5,11 @@ import {
   useRef,
   useCallback,
   useEffect,
+  useMemo,
   KeyboardEvent,
 } from "react";
+import Link from "next/link";
+import { createClient } from "@/lib/supabase/client";
 import {
   Send,
   LayoutTemplate,
@@ -57,7 +60,17 @@ import {
   blankButtonsPayload,
 } from "@/components/interactive/interactive-builder";
 import { validateInteractivePayload } from "@/lib/whatsapp/interactive";
-import type { InteractiveMessagePayload, QuickReply } from "@/types";
+import type {
+  Contact,
+  InteractiveMessagePayload,
+  MessageTemplate,
+  QuickReply,
+} from "@/types";
+import type { TemplateSendValues } from "./template-picker";
+import {
+  extractTemplateVariables,
+  extractVariableIndices,
+} from "@/lib/whatsapp/template-validators";
 import { QuickReplyPicker } from "./quick-reply-picker";
 import {
   analyzeOutgoingMessage,
@@ -120,13 +133,48 @@ interface MediaDraft {
 
 interface MessageComposerProps {
   conversationId: string;
+  contact?: Contact | null;
   sessionExpired: boolean;
   onSend: (text: string, replyToId?: string) => void;
   onSendMedia: (payload: SendMediaPayload) => void;
   onSendInteractive: (payload: InteractiveMessagePayload, replyToId?: string) => void;
+  onSendTemplate?: (template: MessageTemplate, values: TemplateSendValues) => void;
   onOpenTemplates: () => void;
   replyTo?: ReplyDraft | null;
   onClearReply?: () => void;
+}
+
+const QUICK_START_TEMPLATE_KEY = "wacrm:quick-start-template";
+
+/**
+ * Approved templates eligible for WhatsApp-style direct typing when a
+ * chat is brand new or outside the 24-hour customer service window:
+ * 1 or 2 body variables, no required text-header variable or dynamic URL
+ * button variable.
+ */
+function isQuickStartEligible(tpl: MessageTemplate): boolean {
+  const bodyVars = extractTemplateVariables(tpl.body_text);
+  if (bodyVars.length < 1 || bodyVars.length > 2) return false;
+  if (
+    tpl.header_type === "text" &&
+    tpl.header_content &&
+    extractTemplateVariables(tpl.header_content).length > 0
+  ) {
+    return false;
+  }
+  if (
+    tpl.header_type &&
+    tpl.header_type !== "text" &&
+    tpl.header_type !== "document" &&
+    !tpl.header_media_url
+  ) {
+    return false;
+  }
+  const hasDynamicUrl = (tpl.buttons ?? []).some(
+    (b) => b.type === "URL" && extractVariableIndices(b.url).length > 0,
+  );
+  if (hasDynamicUrl) return false;
+  return true;
 }
 
 function formatDuration(seconds: number): string {
@@ -142,20 +190,37 @@ const OPUS_ENCODER_PATH = "/opus/encoderWorker.min.js";
 
 export function MessageComposer({
   conversationId,
+  contact,
   sessionExpired,
   onSend,
   onSendMedia,
   onSendInteractive,
+  onSendTemplate,
   onOpenTemplates,
   replyTo,
   onClearReply,
 }: MessageComposerProps) {
   const t = useTranslations("Inbox.composer");
+  const tGate = useTranslations("GatedButton");
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [drafting, setDrafting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Enter-to-send only on devices with a mouse/keyboard (fine pointer).
+  // On touch devices (phones) Enter inserts a newline and the Send button
+  // is the only way to send — there's no practical Shift+Enter on a phone,
+  // so intercepting Enter there blocks multi-line messages.
+  const [enterSends, setEnterSends] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(pointer: fine)");
+    const apply = () => setEnterSends(mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
 
   // Interactive-message builder dialog + quick-reply picker.
   const [interactiveOpen, setInteractiveOpen] = useState(false);
@@ -201,8 +266,68 @@ export function MessageComposer({
   // every capability — so the disabled branch is a no-op there.
   const canSend = useCan("send-messages");
   const readOnly = !canSend;
-  // Media (like free-form text) is only allowed inside the 24h window.
+
+  // Approved dynamic templates that let an agent type & send directly
+  // in a brand-new chat (or outside the 24-hour window) without leaving
+  // the composer — 100% compliant with Meta's Cloud API template rule.
+  const [quickTemplates, setQuickTemplates] = useState<MessageTemplate[]>([]);
+  const [selectedQuickTemplateId, setSelectedQuickTemplateId] = useState<string>("");
+
+  useEffect(() => {
+    if (!sessionExpired || readOnly || !onSendTemplate) return;
+    let cancelled = false;
+    (async () => {
+      const supabase = createClient();
+      const { data } = await supabase
+        .from("message_templates")
+        .select("*")
+        .eq("status", "APPROVED")
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      const eligible = ((data as MessageTemplate[]) ?? []).filter(
+        isQuickStartEligible,
+      );
+      setQuickTemplates(eligible);
+      if (eligible.length > 0) {
+        let saved = "";
+        try {
+          saved = localStorage.getItem(QUICK_START_TEMPLATE_KEY) ?? "";
+        } catch {
+          // ignore storage errors
+        }
+        const match =
+          eligible.find((tpl) => tpl.id === saved) ??
+          eligible.find((tpl) => !tpl.header_type || tpl.header_type === "text") ??
+          eligible[0];
+        setSelectedQuickTemplateId(match.id);
+      } else {
+        setSelectedQuickTemplateId("");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionExpired, readOnly, onSendTemplate]);
+
+  const activeQuickTemplate = useMemo(
+    () =>
+      sessionExpired && onSendTemplate
+        ? (quickTemplates.find((tpl) => tpl.id === selectedQuickTemplateId) ??
+          null)
+        : null,
+    [sessionExpired, onSendTemplate, quickTemplates, selectedQuickTemplateId],
+  );
+
+  const canQuickStartViaTemplate = Boolean(activeQuickTemplate && !readOnly);
+  const canAttachPdfForQuickTemplate = Boolean(
+    canQuickStartViaTemplate && activeQuickTemplate?.header_type === "document",
+  );
+
+  // Media (like free-form text) is only allowed inside the 24h window,
+  // except PDF upload when a Document-Header Quick-Start template is active.
   const inputsDisabled = readOnly || sessionExpired;
+  const textInputDisabled =
+    readOnly || (sessionExpired && !canQuickStartViaTemplate);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -234,11 +359,28 @@ export function MessageComposer({
 
   const handleSend = useCallback(async () => {
     const trimmed = text.trim();
-    if (!trimmed || sending || sessionExpired) return;
+    if (!trimmed || sending || readOnly) return;
+    if (sessionExpired && !activeQuickTemplate) return;
 
     setSending(true);
     try {
-      onSend(trimmed, replyTo?.id);
+      if (sessionExpired && activeQuickTemplate && onSendTemplate) {
+        const bodyVars = extractTemplateVariables(activeQuickTemplate.body_text);
+        // 1 variable -> typed text; 2 variables -> [contact name, typed text].
+        const bodyValues =
+          bodyVars.length === 1
+            ? [trimmed]
+            : [contact?.name?.trim() || "Customer", trimmed];
+        onSendTemplate(activeQuickTemplate, {
+          body: bodyValues,
+          ...(activeQuickTemplate.header_type === "document" &&
+          activeQuickTemplate.header_media_url
+            ? { headerMediaUrl: activeQuickTemplate.header_media_url }
+            : {}),
+        });
+      } else {
+        onSend(trimmed, replyTo?.id);
+      }
       setText("");
       setPreviewOpen(false);
       if (textareaRef.current) {
@@ -247,7 +389,17 @@ export function MessageComposer({
     } finally {
       setSending(false);
     }
-  }, [text, sending, sessionExpired, onSend, replyTo?.id]);
+  }, [
+    text,
+    sending,
+    readOnly,
+    sessionExpired,
+    activeQuickTemplate,
+    onSendTemplate,
+    contact?.name,
+    onSend,
+    replyTo?.id,
+  ]);
 
   const formattingAnalysis = analyzeOutgoingMessage(text);
 
@@ -258,12 +410,12 @@ export function MessageComposer({
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
+      if (e.key === "Enter" && !e.shiftKey && enterSends) {
         e.preventDefault();
         handleSend();
       }
     },
-    [handleSend]
+    [handleSend, enterSends]
   );
 
   const handleChange = useCallback(
@@ -410,9 +562,11 @@ export function MessageComposer({
       const max = MEDIA_MAX_BYTES_BY_KIND[kind];
       if (file.size > max) {
         toast.error(
-          `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — ${kind} limit is ${Math.round(
-            max / 1024 / 1024,
-          )} MB.`,
+          t("fileTooLarge", {
+            size: (file.size / 1024 / 1024).toFixed(1),
+            kind: t(`mediaKind.${kind}`),
+            max: Math.round(max / 1024 / 1024),
+          }),
         );
         return;
       }
@@ -423,12 +577,12 @@ export function MessageComposer({
         removeStaged(draftRef.current?.path);
         setDraft({ kind, mediaUrl: publicUrl, path, filename: file.name, caption: "" });
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Upload failed.");
+        toast.error(err instanceof Error ? err.message : t("uploadFailed"));
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged],
+    [removeStaged, t],
   );
 
   const handlePicked = useCallback(
@@ -460,7 +614,7 @@ export function MessageComposer({
         removeStaged(draftRef.current?.path);
         setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Upload failed.");
+        toast.error(err instanceof Error ? err.message : t("uploadFailed"));
       } finally {
         setBusy(false);
       }
@@ -527,6 +681,28 @@ export function MessageComposer({
 
   const sendDraft = useCallback(() => {
     if (!draft || busy) return;
+    if (
+      sessionExpired &&
+      draft.kind === "document" &&
+      activeQuickTemplate?.header_type === "document" &&
+      onSendTemplate
+    ) {
+      const bodyVars = extractTemplateVariables(activeQuickTemplate.body_text);
+      const captionText =
+        draft.caption.trim() || `Please find ${draft.filename} attached.`;
+      const bodyValues =
+        bodyVars.length === 1
+          ? [captionText]
+          : [contact?.name?.trim() || "Customer", captionText];
+      onSendTemplate(activeQuickTemplate, {
+        body: bodyValues,
+        headerMediaUrl: draft.mediaUrl,
+        headerDocumentFilename: draft.filename,
+      });
+      setDraft(null);
+      onClearReply?.();
+      return;
+    }
     onSendMedia({
       kind: draft.kind,
       mediaUrl: draft.mediaUrl,
@@ -541,7 +717,17 @@ export function MessageComposer({
     // The object is now owned by the sent message — clear without GC.
     setDraft(null);
     onClearReply?.();
-  }, [draft, busy, onSendMedia, replyTo?.id, onClearReply]);
+  }, [
+    draft,
+    busy,
+    sessionExpired,
+    activeQuickTemplate,
+    onSendTemplate,
+    contact?.name,
+    onSendMedia,
+    replyTo?.id,
+    onClearReply,
+  ]);
 
   // Discard GCs the staged object — it was uploaded but never sent.
   const discardDraft = useCallback(() => {
@@ -567,19 +753,64 @@ export function MessageComposer({
         </div>
       )}
       {sessionExpired && (
-        <div className="mb-2 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2">
-          <p className="text-xs text-amber-400">
-            {t("sessionExpiredHint")}
-          </p>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs text-amber-400 hover:text-amber-300"
-            onClick={onOpenTemplates}
-          >
-            <LayoutTemplate className="mr-1 h-3 w-3" />
-            {t("templates")}
-          </Button>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
+          {activeQuickTemplate ? (
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-xs text-amber-300">
+              <span>
+                24h window closed — type below to send via approved template:
+              </span>
+              <select
+                value={selectedQuickTemplateId}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  setSelectedQuickTemplateId(id);
+                  try {
+                    localStorage.setItem(QUICK_START_TEMPLATE_KEY, id);
+                  } catch {
+                    // ignore
+                  }
+                }}
+                aria-label="Quick-start template"
+                className="h-7 max-w-[200px] rounded border border-amber-500/40 bg-background/80 px-2 text-xs text-foreground outline-none"
+              >
+                {quickTemplates.map((tpl) => (
+                  <option key={tpl.id} value={tpl.id}>
+                    {tpl.name}
+                    {tpl.header_type === "document" ? " (PDF)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <p className="min-w-0 flex-1 text-xs text-amber-300">
+              WhatsApp requires an approved template for new chats / outside 24h.
+              Create a 1-click Quick-Start Template (e.g.{" "}
+              <code className="rounded bg-amber-500/20 px-1">
+                {"Hi {{1}}, {{2}}"}
+              </code>
+              ) to type &amp; send directly here, or pick any approved template.
+            </p>
+          )}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {!activeQuickTemplate && (
+              <Link
+                href="/settings?tab=templates&preset=quick_chat"
+                className="inline-flex h-7 items-center gap-1 rounded-md border border-amber-500/40 bg-background/60 px-2.5 text-xs font-medium text-amber-300 hover:bg-background"
+              >
+                <Plus className="h-3 w-3" />
+                Create Quick-Start Template
+              </Link>
+            )}
+            <Button
+              variant="default"
+              size="sm"
+              className="h-7 bg-primary text-xs text-primary-foreground hover:bg-primary/90"
+              onClick={onOpenTemplates}
+            >
+              <LayoutTemplate className="mr-1 h-3 w-3" />
+              {activeQuickTemplate ? "All Templates" : t("templates")}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -649,15 +880,19 @@ export function MessageComposer({
           </Button>
         </div>
       ) : (
-        <div className="flex items-end gap-2">
+        <div className="flex flex-wrap items-end gap-2">
+          {/* Action buttons. On mobile this group wraps to its own row
+              below the textarea (basis-full + order-2) so the input gets
+              the full width; on sm+ it sits inline before the textarea. */}
+          <div className="order-2 flex basis-full items-end gap-2 sm:order-1 sm:basis-auto">
           {/* Attach menu — photo / video / document / voice. */}
           <DropdownMenu>
             <DropdownMenuTrigger
-              disabled={inputsDisabled || busy}
+              disabled={(inputsDisabled && !canAttachPdfForQuickTemplate) || busy}
               title={
                 readOnly
                   ? t("readOnlyTitle")
-                  : inputsDisabled
+                  : inputsDisabled && !canAttachPdfForQuickTemplate
                     ? undefined
                     : t("attachMedia")
               }
@@ -670,22 +905,28 @@ export function MessageComposer({
               )}
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="border-border bg-popover">
-              <DropdownMenuItem onClick={() => imageInputRef.current?.click()}>
-                <ImageIcon className="mr-2 h-4 w-4" />
-                {t("photo")}
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => videoInputRef.current?.click()}>
-                <Video className="mr-2 h-4 w-4" />
-                {t("video")}
-              </DropdownMenuItem>
+              {!sessionExpired && (
+                <>
+                  <DropdownMenuItem onClick={() => imageInputRef.current?.click()}>
+                    <ImageIcon className="mr-2 h-4 w-4" />
+                    {t("photo")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => videoInputRef.current?.click()}>
+                    <Video className="mr-2 h-4 w-4" />
+                    {t("video")}
+                  </DropdownMenuItem>
+                </>
+              )}
               <DropdownMenuItem onClick={() => documentInputRef.current?.click()}>
                 <FileText className="mr-2 h-4 w-4" />
                 {t("document")}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void startRecording()}>
-                <Mic className="mr-2 h-4 w-4" />
-                {t("voiceNote")}
-              </DropdownMenuItem>
+              {!sessionExpired && (
+                <DropdownMenuItem onClick={() => void startRecording()}>
+                  <Mic className="mr-2 h-4 w-4" />
+                  {t("voiceNote")}
+                </DropdownMenuItem>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
 
@@ -721,7 +962,7 @@ export function MessageComposer({
             variant="ghost"
             size="sm"
             canAct={!readOnly}
-            gateReason="send messages"
+            gateReason={tGate("reasons.sendMessages")}
             title={readOnly ? undefined : t("sendTemplate")}
             className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground"
             onClick={onOpenTemplates}
@@ -733,7 +974,7 @@ export function MessageComposer({
             variant="ghost"
             size="sm"
             canAct={!readOnly}
-            gateReason="send messages"
+            gateReason={tGate("reasons.sendMessages")}
             disabled={drafting}
             title={readOnly ? undefined : t("draftWithAI")}
             className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-primary"
@@ -745,6 +986,7 @@ export function MessageComposer({
               <Sparkles className="h-4 w-4" />
             )}
           </GatedButton>
+          </div>
 
           <textarea
             ref={textareaRef}
@@ -755,18 +997,20 @@ export function MessageComposer({
               readOnly
                 ? t("readOnlyPlaceholder")
                 : sessionExpired
-                  ? t("sessionExpiredPlaceholder")
+                  ? activeQuickTemplate
+                    ? `Type your message (sent via approved template "${activeQuickTemplate.name}")...`
+                    : t("sessionExpiredPlaceholder")
                   : t("typeMessagePlaceholder")
             }
-            disabled={sessionExpired || readOnly}
+            disabled={textInputDisabled}
             rows={1}
             // Textarea keeps its own inline title — the GatedButton
             // wrapping pattern doesn't apply to non-button inputs.
             // The placeholder text also surfaces the read-only state.
             title={readOnly ? t("readOnlyTitle") : undefined}
             className={cn(
-              "flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50",
-              (sessionExpired || readOnly) && "cursor-not-allowed opacity-50"
+              "order-1 min-w-0 flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50 sm:order-2",
+              textInputDisabled && "cursor-not-allowed opacity-50"
             )}
           />
 
@@ -774,11 +1018,11 @@ export function MessageComposer({
             type="button"
             variant="ghost"
             size="sm"
-            disabled={!text.trim() || sessionExpired || readOnly}
+            disabled={!text.trim() || textInputDisabled}
             onClick={() => setPreviewOpen(true)}
             title="Preview message before sending"
             aria-label="Preview message"
-            className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground disabled:opacity-40"
+            className="order-1 h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground disabled:opacity-40 sm:order-3"
           >
             <Eye className="h-4 w-4" />
           </Button>
@@ -786,10 +1030,10 @@ export function MessageComposer({
           <GatedButton
             size="sm"
             canAct={!readOnly}
-            gateReason="send messages"
-            disabled={!text.trim() || sessionExpired || sending}
+            gateReason={tGate("reasons.sendMessages")}
+            disabled={!text.trim() || textInputDisabled || sending}
             onClick={handleSend}
-            className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
+            className="order-1 h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40 sm:order-3"
           >
             <Send className="h-4 w-4" />
           </GatedButton>
@@ -799,7 +1043,7 @@ export function MessageComposer({
       {/* Hint + live formatting status sits outside the flex row so its
           height doesn't push `items-end` buttons below the textarea. */}
       {!draft && !recording && (
-        <div className="mt-1 flex flex-wrap items-center justify-between gap-2 pl-[5.5rem] text-[10px] text-muted-foreground">
+        <div className="mt-1 flex flex-wrap items-center justify-between gap-2 pl-1 text-[10px] text-muted-foreground sm:pl-[5.5rem]">
           <span>{t("draftHint")}</span>
           {text.trim().length > 0 && (
             <div className="flex items-center gap-2">
@@ -954,7 +1198,7 @@ export function MessageComposer({
             </Button>
             <Button
               type="button"
-              disabled={!text.trim() || sending || sessionExpired}
+              disabled={!text.trim() || sending || textInputDisabled}
               onClick={() => void handleSend()}
               className="bg-primary text-primary-foreground hover:bg-primary/90"
             >
@@ -991,6 +1235,7 @@ function MediaDraftPreview({
   onSend: () => void;
   t: ReturnType<typeof useTranslations>;
 }) {
+  const tGate = useTranslations("GatedButton");
   return (
     <div className="rounded-xl border border-border bg-muted/40 p-3">
       <div className="flex items-start gap-3">
@@ -1045,7 +1290,7 @@ function MediaDraftPreview({
         <GatedButton
           size="sm"
           canAct={!readOnly}
-          gateReason="send messages"
+          gateReason={tGate("reasons.sendMessages")}
           disabled={busy}
           onClick={onSend}
           className={cn(

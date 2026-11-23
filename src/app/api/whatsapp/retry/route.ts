@@ -22,6 +22,8 @@ import {
 } from '@/lib/whatsapp/phone-utils';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import {
+  explainSendFailure,
+  extractTemplateBodyParams,
   isOutside24HourWindowError,
   isWithin24HourWindow,
   withTransientRetry,
@@ -217,6 +219,7 @@ export async function POST(request: Request) {
 
     let templateRow: MessageTemplate | null = null;
     let templateLanguage = 'en_US';
+    let templateBodyParams: string[] = [];
     if (msg.content_type === 'template' && msg.template_name) {
       const resolved = await resolveTemplateRow(
         supabase,
@@ -240,14 +243,49 @@ export async function POST(request: Request) {
       }
       templateRow = resolved.row;
       templateLanguage = resolved.language;
+
+      if (templateRow) {
+        const extracted = extractTemplateBodyParams(
+          templateRow.body_text,
+          msg.content_text,
+        );
+        if (extracted === null) {
+          await supabase
+            .from('messages')
+            .update({ status: 'failed', ...originalErrorFields })
+            .eq('id', messageId);
+          claimedMessageId = null;
+          return NextResponse.json(
+            {
+              error:
+                'Template variables could not be auto-filled from the original message — please confirm them in the template picker.',
+              code: 'template_params_required',
+              template_name: msg.template_name,
+            },
+            { status: 422 },
+          );
+        }
+        templateBodyParams = extracted;
+      }
     }
 
     const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(
       msg.content_type,
     );
 
+    const filenameFromUrl = (url: string): string | undefined => {
+      try {
+        const seg = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
+        return seg || undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
     const attempt = async (target: string): Promise<string> => {
       if (msg.content_type === 'template' && msg.template_name) {
+        const headerMediaUrl =
+          msg.media_url || templateRow?.header_media_url || undefined;
         const res = await sendTemplateMessage({
           phoneNumberId: config.phone_number_id,
           accessToken,
@@ -255,9 +293,14 @@ export async function POST(request: Request) {
           templateName: msg.template_name,
           language: templateLanguage,
           template: templateRow ?? undefined,
-          messageParams: msg.media_url
-            ? { headerMediaUrl: msg.media_url }
-            : undefined,
+          params: templateBodyParams,
+          messageParams: {
+            body: templateBodyParams,
+            ...(headerMediaUrl ? { headerMediaUrl } : {}),
+            ...(templateRow?.header_type === 'document' && headerMediaUrl
+              ? { headerDocumentFilename: filenameFromUrl(headerMediaUrl) }
+              : {}),
+          },
           contextMessageId,
         });
         return res.messageId;
@@ -348,13 +391,14 @@ export async function POST(request: Request) {
         err instanceof Error ? err.message : 'Unknown Meta API error';
       const metaCode = err instanceof MetaApiError ? err.code : null;
       const metaDetails = err instanceof MetaApiError ? err.details : null;
+      const readableError = explainSendFailure(metaCode, errMsg, metaDetails);
 
       await supabase
         .from('messages')
         .update({
           status: 'failed',
           error_code: metaCode ?? originalErrorFields.error_code,
-          error_title: errMsg,
+          error_title: readableError,
           error_details: metaDetails ?? null,
         })
         .eq('id', messageId);
@@ -362,7 +406,8 @@ export async function POST(request: Request) {
 
       return NextResponse.json(
         {
-          error: `Meta API error: ${errMsg}`,
+          error: readableError,
+          meta_code: metaCode,
           code: isOutside24HourWindowError(metaCode, errMsg)
             ? 'window_expired'
             : 'meta_error',

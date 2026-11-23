@@ -24,6 +24,8 @@ import {
   type MediaHeaderKind,
 } from '@/lib/whatsapp/media-header-types';
 import { useAuth } from '@/hooks/use-auth';
+import { fetchAccountTemplates } from '@/lib/settings/account-catalog';
+import { canEditTemplateCategory } from '@/lib/whatsapp/template-category-edit';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -131,8 +133,11 @@ function emptyButton(type: TemplateButton['type']): TemplateButton {
 
 export function TemplateManager() {
   const t = useTranslations('Settings.templates');
+  // Meta's category ids (stored as-is) → display label in the UI language.
+  const categoryLabel = (category: string) =>
+    t.has(`categoryLabels.${category}`) ? t(`categoryLabels.${category}`) : category;
   const supabase = createClient();
-  const { user, loading: authLoading } = useAuth();
+  const { user, accountId, loading: authLoading } = useAuth();
 
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
@@ -145,6 +150,9 @@ export function TemplateManager() {
   // dialog title + CTA. Set to the template id to pre-fill from a row.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const editingTemplate = templates.find((template) => template.id === editingId);
+  const categoryLocked =
+    editingTemplate !== undefined && !canEditTemplateCategory(editingTemplate.status);
   // Template selected for the confirm-delete dialog. The destructive
   // action goes through this two-step so a slip on the trash icon
   // doesn't take the template off Meta as well as locally.
@@ -156,6 +164,13 @@ export function TemplateManager() {
   // Resumable-Upload handle.
   const [uploadingHeader, setUploadingHeader] = useState(false);
   const headerFileRef = useRef<HTMLInputElement>(null);
+  // Extra clickable links (Links #3–#5) appended cleanly to body_text on
+  // submit so templates can carry up to 5 clickable URLs without tripping
+  // Meta's hard 2-URL-button API limit.
+  const [extraBodyLinks, setExtraBodyLinks] = useState<
+    Array<{ title: string; url: string }>
+  >([]);
+  const presetConsumedRef = useRef(false);
 
   // Body variable indices — `[1, 2, 3]` for "{{1}} {{2}} {{3}}". We
   // re-run the extractor on every render to keep the sample-value rows
@@ -185,24 +200,44 @@ export function TemplateManager() {
 
   useEffect(() => {
     if (authLoading) return;
-    if (!user) {
+    if (!user || !accountId) {
       setLoading(false);
       return;
     }
-    fetchTemplates(user.id);
+    fetchTemplates(accountId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, user?.id]);
+  }, [authLoading, user?.id, accountId]);
 
-  async function fetchTemplates(userId: string) {
+  // If navigated from Inbox ("Create Quick-Start Template"), auto-open
+  // the modal pre-filled with a clean, Meta-approvable Utility template
+  // that lets agents type & send directly in brand-new chats.
+  useEffect(() => {
+    if (loading || presetConsumedRef.current) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('preset') === 'quick_chat') {
+      presetConsumedRef.current = true;
+      setEditingId(null);
+      setExtraBodyLinks([]);
+      setForm({
+        ...emptyForm,
+        name: 'direct_message_update',
+        category: 'Utility',
+        language: 'en_US',
+        body_text: 'Hi {{1}}, {{2}}',
+        body_samples: [
+          'Alex',
+          'Thank you for reaching out. Here is your requested update.',
+        ],
+      });
+      setDialogOpen(true);
+    }
+  }, [loading]);
+
+  async function fetchTemplates(acctId: string) {
     try {
       setLoading(true);
-      const { data, error } = await supabase
-        .from('message_templates')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      setTemplates(data || []);
+      setTemplates(await fetchAccountTemplates(supabase, acctId));
     } catch (err) {
       console.error('Failed to fetch templates:', err);
       toast.error(t('toastLoadFailed'));
@@ -220,6 +255,18 @@ export function TemplateManager() {
       sample_values.header = [form.header_sample.trim()];
     }
 
+    // Append any extra clickable body links (Links #3–#5) cleanly so Meta
+    // approves them as standard clickable WhatsApp body links.
+    const formattedExtraLinks = extraBodyLinks
+      .filter((l) => l.url.trim().length > 0)
+      .map((l) =>
+        l.title.trim() ? `${l.title.trim()}: ${l.url.trim()}` : l.url.trim(),
+      )
+      .join('\n');
+    const combinedBody = formattedExtraLinks
+      ? `${form.body_text.trim()}\n\n${formattedExtraLinks}`
+      : form.body_text.trim();
+
     return {
       name: form.name.trim(),
       category: form.category,
@@ -231,7 +278,7 @@ export function TemplateManager() {
         form.header_format !== 'none' && form.header_format !== 'text'
           ? form.header_media_url.trim() || undefined
           : undefined,
-      body_text: form.body_text.trim(),
+      body_text: combinedBody,
       footer_text: form.footer_text.trim() || undefined,
       buttons: form.buttons.length > 0 ? form.buttons : undefined,
       sample_values:
@@ -241,6 +288,7 @@ export function TemplateManager() {
 
   function openEdit(template: MessageTemplate) {
     setEditingId(template.id);
+    setExtraBodyLinks([]);
     setForm({
       name: template.name,
       category: template.category,
@@ -259,6 +307,7 @@ export function TemplateManager() {
 
   function openCreate() {
     setEditingId(null);
+    setExtraBodyLinks([]);
     setForm(emptyForm);
     setDialogOpen(true);
   }
@@ -286,7 +335,7 @@ export function TemplateManager() {
       }
       // Refresh first, then close — re-opening the dialog
       // immediately should not show a stale list.
-      if (user) await fetchTemplates(user.id);
+      if (accountId) await fetchTemplates(accountId);
       toast.success(
         data.dry_run
           ? isEdit
@@ -314,7 +363,7 @@ export function TemplateManager() {
       const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);
+        throw new Error(data?.error || t('syncFailedHttp', { status: res.status }));
       }
       toast.success(
         t('toastSyncCount', { total: data.total }) +
@@ -328,7 +377,7 @@ export function TemplateManager() {
             `${e.name} (${e.language})`,
         );
         const suffix =
-          data.errors.length > 3 ? `, +${data.errors.length - 3} more` : '';
+          data.errors.length > 3 ? t('syncMoreSuffix', { count: data.errors.length - 3 }) : '';
         toast.error(t('toastSyncFailed', { preview: preview.join(', ') + suffix }));
       }
       if (data.truncated) {
@@ -340,7 +389,7 @@ export function TemplateManager() {
           { duration: 10000 },
         );
       }
-      await fetchTemplates(user.id);
+      if (accountId) await fetchTemplates(accountId);
     } catch (err) {
       console.error('Template sync error:', err);
       toast.error(err instanceof Error ? err.message : t('toastSyncError'));
@@ -362,7 +411,7 @@ export function TemplateManager() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data?.error || `Delete failed (HTTP ${res.status})`);
+        throw new Error(data?.error || t('deleteFailedHttp', { status: res.status }));
       }
       toast.success(t('toastDeleteSuccess'));
       setTemplates((prev) => prev.filter((t) => t.id !== target.id));
@@ -576,7 +625,7 @@ export function TemplateManager() {
                       <Badge
                         className={`text-xs border ${categoryColors[template.category] || ''}`}
                       >
-                        {template.category}
+                        {categoryLabel(template.category)}
                       </Badge>
                       <Badge className={`text-xs border ${status.classes}`}>
                         {status.label}
@@ -733,6 +782,7 @@ export function TemplateManager() {
                       category: val as MessageTemplate['category'],
                     })
                   }
+                  disabled={categoryLocked}
                 >
                   <SelectTrigger className="w-full bg-muted border-border text-foreground">
                     <SelectValue />
@@ -744,11 +794,16 @@ export function TemplateManager() {
                         value={cat}
                         className="text-popover-foreground focus:bg-muted focus:text-popover-foreground"
                       >
-                        {cat}
+                        {categoryLabel(cat)}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {categoryLocked && (
+                  <p className="text-[11px] text-muted-foreground">
+                    {t('categoryFixed')}
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -893,7 +948,7 @@ export function TemplateManager() {
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
                       src={form.header_media_url}
-                      alt="Header sample"
+                      alt={t('headerSampleAlt')}
                       className="max-h-28 rounded-md border border-border object-contain"
                     />
                   )}
@@ -1092,15 +1147,27 @@ export function TemplateManager() {
                             }
                             className="bg-muted border-border text-foreground placeholder:text-muted-foreground h-8 text-xs"
                           />
+                          {btn.url.trim() && !/^https?:\/\//i.test(btn.url.trim()) && (
+                            <p className="text-[11px] text-amber-400">
+                              URL must start with https:// or http:// for Meta approval.
+                            </p>
+                          )}
                           {extractVariableIndices(btn.url).length > 0 && (
-                            <Input
-                              placeholder={t.raw('urlSamplePlaceholder')}
-                              value={btn.example ?? ''}
-                              onChange={(e) =>
-                                updateButton(i, { example: e.target.value })
-                              }
-                              className="bg-muted border-border text-foreground placeholder:text-muted-foreground h-8 text-xs"
-                            />
+                            <>
+                              <Input
+                                placeholder={t.raw('urlSamplePlaceholder')}
+                                value={btn.example ?? ''}
+                                onChange={(e) =>
+                                  updateButton(i, { example: e.target.value })
+                                }
+                                className="bg-muted border-border text-foreground placeholder:text-muted-foreground h-8 text-xs"
+                              />
+                              {btn.example && /^https?:\/\//i.test(btn.example.trim()) && (
+                                <p className="text-[11px] text-amber-400">
+                                  Enter only the suffix value for {'{{1}}'} (e.g. &ldquo;order-123&rdquo;), not the full URL.
+                                </p>
+                              )}
+                            </>
                           )}
                         </div>
                       )}
@@ -1124,6 +1191,74 @@ export function TemplateManager() {
                           className="bg-muted border-border text-foreground placeholder:text-muted-foreground h-8 text-xs"
                         />
                       )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Extra Clickable Links (Links #3–#5) — Meta-approved way to include up to 5 links */}
+            <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <Label className="text-xs font-medium text-foreground">
+                    Extra Clickable Links ({urlButtonCount + extraBodyLinks.length}/5 total links)
+                  </Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    Need 3–5 links? Add extra links here — they are formatted cleanly into the message body so WhatsApp makes them clickable and Meta approves the template.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={urlButtonCount + extraBodyLinks.length >= 5}
+                  onClick={() =>
+                    setExtraBodyLinks((prev) => [...prev, { title: '', url: '' }])
+                  }
+                  className="h-7 border-border bg-transparent text-xs text-muted-foreground hover:bg-muted"
+                >
+                  <Plus className="size-3" />
+                  Add Extra Link
+                </Button>
+              </div>
+              {extraBodyLinks.length > 0 && (
+                <div className="space-y-2 pt-1">
+                  {extraBodyLinks.map((link, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <Input
+                        placeholder={`Link #${urlButtonCount + idx + 1} title (e.g. Pricing)`}
+                        value={link.title}
+                        onChange={(e) => {
+                          const next = [...extraBodyLinks];
+                          next[idx] = { ...next[idx], title: e.target.value };
+                          setExtraBodyLinks(next);
+                        }}
+                        className="h-8 w-40 border-border bg-muted text-xs text-foreground"
+                      />
+                      <Input
+                        placeholder="https://example.com/page"
+                        value={link.url}
+                        onChange={(e) => {
+                          const next = [...extraBodyLinks];
+                          next[idx] = { ...next[idx], url: e.target.value };
+                          setExtraBodyLinks(next);
+                        }}
+                        className="h-8 flex-1 border-border bg-muted text-xs text-foreground"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={() =>
+                          setExtraBodyLinks((prev) =>
+                            prev.filter((_, i) => i !== idx),
+                          )
+                        }
+                        className="size-7 text-muted-foreground hover:bg-red-950/30 hover:text-red-400"
+                      >
+                        <X className="size-3.5" />
+                      </Button>
                     </div>
                   ))}
                 </div>

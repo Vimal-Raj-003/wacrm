@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { BarChart3, Bot, PencilLine } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
@@ -23,7 +23,7 @@ import {
 import { Skeleton } from '@/components/dashboard/skeleton';
 import { BarChart } from '@/components/tremor/bar-chart';
 import { formatCompactNumber } from '@/lib/currency';
-import { format, parseISO } from 'date-fns';
+import { parseISO } from 'date-fns';
 
 interface UsageResponse {
   window_days: number;
@@ -56,6 +56,7 @@ const WINDOWS = [7, 30, 90] as const;
  */
 export function AiUsageCard() {
   const t = useTranslations('Agents.usage');
+  const locale = useLocale();
   const { accountId, accountRole, profileLoading } = useAuth();
   const canView = accountRole ? canEditSettings(accountRole) : false;
 
@@ -67,7 +68,11 @@ export function AiUsageCard() {
   const fetchUsage = useCallback(async (windowDays: number) => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/ai/usage?days=${windowDays}`, {
+      const params = new URLSearchParams({
+        days: String(windowDays),
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+      const res = await fetch(`/api/ai/usage?${params}`, {
         cache: 'no-store',
       });
       const json = await res.json().catch(() => null);
@@ -101,7 +106,7 @@ export function AiUsageCard() {
   const tokensLabel = t('tokens');
   const chartData =
     data?.daily.map((d) => ({
-      day: format(parseISO(d.date), 'MMM d'),
+      day: parseISO(d.date).toLocaleDateString(locale, { month: 'short', day: 'numeric' }),
       [tokensLabel]: d.tokens,
     })) ?? [];
   const hasSpend = (data?.totals.total_tokens ?? 0) > 0;

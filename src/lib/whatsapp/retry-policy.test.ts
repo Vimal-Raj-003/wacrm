@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MetaApiError } from './meta-api';
 import {
+  extractTemplateBodyParams,
   isOutside24HourWindowError,
   isRetryableMetaError,
   isWithin24HourWindow,
@@ -90,5 +91,29 @@ describe('retry-policy', () => {
 
     expect(calls).toBe(1);
     expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('extracts positional and named template body variables for retry', () => {
+    expect(
+      extractTemplateBodyParams(
+        'Hi {{1}}, your order {{2}} is ready!',
+        'Hi Vimal, your order #4021 is ready!',
+      ),
+    ).toEqual(['Vimal', '#4021']);
+
+    expect(
+      extractTemplateBodyParams(
+        'Hello {{customer_name}}, {{message}}',
+        'Hello Priya, sharing your invoice PDF now.',
+      ),
+    ).toEqual(['Priya', 'sharing your invoice PDF now.']);
+
+    expect(
+      extractTemplateBodyParams('Static hello message', 'Static hello message'),
+    ).toEqual([]);
+
+    expect(
+      extractTemplateBodyParams('Hi {{1}}, order {{2}}', 'Completely different'),
+    ).toBeNull();
   });
 });

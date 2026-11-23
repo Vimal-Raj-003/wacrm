@@ -13,15 +13,25 @@ import {
 } from '@/lib/whatsapp/wa-identity'
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
-import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
-import { runAutomationsForTrigger } from '@/lib/automations/engine'
+import { claimFirstInboundMessage } from '@/lib/conversations/first-inbound'
+import {
+  verifyMetaWebhookSignature,
+  verifyTokenMatches,
+} from '@/lib/whatsapp/webhook-signature'
+import { readCappedBody } from '@/lib/whatsapp/webhook-body'
+import { resumeAwaitingReply, runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
+  applyBroadcastRecipientStatus,
+  flagBroadcastReply,
+} from '@/lib/whatsapp/broadcast-recipient-webhook'
+import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import { applyMessageStatus } from '@/lib/whatsapp/message-status-sync'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -88,10 +98,23 @@ interface WhatsAppMessage {
   button?: { text?: string; payload?: string }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
+  /**
+   * Why Meta could not hand this message over. Set on a `type:
+   * 'unsupported'` delivery — a view-once photo, a poll, a disappearing
+   * message, or anything sent from an old or unofficial WhatsApp build.
+   * The content is NOT included on such a delivery and cannot be fetched
+   * afterwards, so this reason is the only thing there is to keep.
+   */
+  errors?: MetaError[]
 }
 
-/** One entry of a failed status's `errors` array, as Meta sends it. */
-interface MetaStatusError {
+/**
+ * One entry of an `errors` array, as Meta sends it. Appears on a failed
+ * *status* (why our outbound message bounced) and on an inbound *message*
+ * Meta could not hand over — a `type: 'unsupported'` delivery carries the
+ * reason here and no content at all.
+ */
+interface MetaError {
   code: number
   title: string
   message?: string
@@ -127,7 +150,7 @@ interface WhatsAppWebhookEntry {
          * `title` a short label, `error_data.details` the human-readable
          * explanation. See #535.
          */
-        errors?: MetaStatusError[]
+        errors?: MetaError[]
       }>
     }
     field: string
@@ -170,7 +193,7 @@ export async function GET(request: Request) {
     for (const config of configs) {
       if (!config.verify_token) continue
       try {
-        if (decrypt(config.verify_token) === verifyToken) {
+        if (verifyTokenMatches(decrypt(config.verify_token), verifyToken)) {
           matchedConfig = config
           break
         }
@@ -220,7 +243,11 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   // Read raw body first so we can HMAC-verify the exact bytes Meta
   // signed. request.json() would re-encode and break the signature.
-  const rawBody = await request.text()
+  const rawBody = await readCappedBody(request)
+  if (rawBody === null) {
+    console.warn('[webhook] rejected oversized payload')
+    return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+  }
   const signature = request.headers.get('x-hub-signature-256')
 
   if (!verifyMetaWebhookSignature(rawBody, signature)) {
@@ -263,6 +290,33 @@ export async function POST(request: Request) {
   return NextResponse.json({ status: 'received' }, { status: 200 })
 }
 
+async function resolveAccountForPhoneNumber(
+  phoneNumberId: string | undefined
+): Promise<string | null> {
+  if (!phoneNumberId) return null
+  const { data, error } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('account_id')
+    .eq('phone_number_id', phoneNumberId)
+
+  if (error) {
+    console.error('Error resolving account for status update:', phoneNumberId, error)
+    return null
+  }
+  if (!data || data.length !== 1) {
+    console.error(
+      `Status update for phone_number_id ${phoneNumberId} matched ${data?.length ?? 0} configs; message statuses skipped`
+    )
+    return null
+  }
+  return data[0].account_id
+}
+
+function metaTimestampToIso(timestamp: string): string | null {
+  const seconds = Number.parseInt(timestamp, 10)
+  return Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null
+}
+
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
   if (!body.entry) return
 
@@ -292,8 +346,11 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       // Handle status updates
       if (value.statuses) {
+        const statusAccountId = await resolveAccountForPhoneNumber(
+          value.metadata?.phone_number_id
+        )
         for (const status of value.statuses) {
-          await handleStatusUpdate(status)
+          await handleStatusUpdate(status, statusAccountId)
         }
       }
 
@@ -371,59 +428,6 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
   }
 }
 
-// The happy-path status ladder — pending → sent → delivered → read →
-// replied. Webhook replays must never regress a recipient back down
-// this ladder.
-//
-// `failed` is NOT on this ladder. It's a terminal side branch that is
-// only valid from the early states (pending / sent) — once Meta has
-// delivered or the user has read or replied, a later "failed" status
-// event is a bug in Meta's pipeline or a spoof attempt and must be
-// ignored.
-const RECIPIENT_STATUS_LADDER = [
-  'pending',
-  'sent',
-  'delivered',
-  'read',
-  'replied',
-] as const
-
-function ladderLevel(s: string): number {
-  const idx = (RECIPIENT_STATUS_LADDER as readonly string[]).indexOf(s)
-  return idx < 0 ? -1 : idx
-}
-
-/**
- * Can a recipient transition from `current` to `incoming`?
- *   - Along the ladder, only forward moves are allowed.
- *   - `failed` is accepted only from `pending` or `sent`; it's refused
- *     once the recipient has reached any of the success states.
- */
-function isValidStatusTransition(current: string, incoming: string): boolean {
-  if (incoming === 'failed') {
-    return current === 'pending' || current === 'sent'
-  }
-  if (current === 'failed') {
-    return false // failed is terminal
-  }
-  const ci = ladderLevel(current)
-  const ii = ladderLevel(incoming)
-  if (ii < 0) return false // unknown incoming status
-  if (ci < 0) return true // unknown current — accept anything on the ladder
-  return ii > ci
-}
-
-/**
- * Advance `last_outbound_test_status` when a status update belongs to
- * the Send Test Template message. Ranked so a late `sent` can never
- * demote a `delivered` that already arrived (Meta does not guarantee
- * status ordering), and `failed` always wins so a failure is never
- * hidden by an earlier success.
- *
- * Entirely best-effort: these columns arrive with migration 043, and on
- * an un-migrated instance the update simply fails and is ignored. It
- * must never affect inbound message processing.
- */
 const OUTBOUND_TEST_RANK: Record<string, number> = {
   accepted: 0,
   sent: 1,
@@ -437,7 +441,6 @@ async function recordOutboundTestStatus(wamid: string, nextStatus: string) {
       .from('whatsapp_config')
       .select('account_id, last_outbound_test_status')
       .eq('last_outbound_test_wamid', wamid)
-    // Un-migrated schema (42703) or no match — nothing to do.
     if (error || !rows || rows.length === 0) return
 
     for (const row of rows) {
@@ -451,18 +454,10 @@ async function recordOutboundTestStatus(wamid: string, nextStatus: string) {
         .eq('account_id', row.account_id)
     }
   } catch (err) {
-    // Debug, not warn: not applying is the normal case (no test in
-    // flight, or migration 043 not yet applied) and this must never
-    // look like a delivery problem in the logs.
     console.debug('[webhook] outbound test status not recorded:', err)
   }
 }
 
-/**
- * Stamp `last_inbound_event_at` so "Meta is delivering events to this
- * server" is an observation rather than an assumption. Best-effort for
- * the same reason as above.
- */
 async function recordInboundEvent(accountId: string) {
   try {
     await supabaseAdmin()
@@ -474,13 +469,16 @@ async function recordInboundEvent(accountId: string) {
   }
 }
 
-async function handleStatusUpdate(status: {
-  id: string
-  status: string
-  timestamp: string
-  recipient_id: string
-  errors?: MetaStatusError[]
-}) {
+async function handleStatusUpdate(
+  status: {
+    id: string
+    status: string
+    timestamp: string
+    recipient_id: string
+    errors?: MetaError[]
+  },
+  accountId: string | null
+) {
   // Meta's reason for a failed send (#535). Only read on `failed`; a
   // later non-failed status for the same wamid leaves the error
   // columns alone rather than clearing them, so the reason survives.
@@ -500,25 +498,14 @@ async function handleStatusUpdate(status: {
     )
   }
 
-  // 1) Mirror onto messages (legacy behavior) — Meta's status values
-  //    already match the CHECK constraint on messages.status. No
-  //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
-  //    repeat across numbers), so this updates 0..N rows and must not
-  //    assume a single row.
-  const messageUpdate: Record<string, unknown> = { status: status.status }
-  if (failure) {
-    messageUpdate.error_code = failure.code
-    messageUpdate.error_title = failure.title
-    messageUpdate.error_details = failure.details
-  }
-  const { error: msgErr } = await supabaseAdmin()
-    .from('messages')
-    .update(messageUpdate)
-    .eq('message_id', status.id)
-
-  if (msgErr) {
-    console.error('Error updating message status:', msgErr)
-  }
+  const advancedMessages = accountId
+    ? await applyMessageStatus(supabaseAdmin(), accountId, {
+        wamid: status.id,
+        status: status.status,
+        failure,
+        statusAt: metaTimestampToIso(status.timestamp),
+      })
+    : []
 
   // 1b) If this status belongs to the connection test sent from the
   //     WhatsApp settings screen, record how far it actually got.
@@ -536,108 +523,40 @@ async function handleStatusUpdate(status: {
   //    (added in migration 003). The aggregate trigger on
   //    broadcast_recipients re-derives the parent broadcast's
   //    sent/delivered/read/failed counts automatically.
-  const tsIso = new Date(parseInt(status.timestamp) * 1000).toISOString()
-
-  const { data: recipient, error: recFetchErr } = await supabaseAdmin()
-    .from('broadcast_recipients')
-    .select('id, status')
-    .eq('whatsapp_message_id', status.id)
-    .maybeSingle()
-
-  if (recFetchErr) {
-    console.error('Error fetching broadcast recipient:', recFetchErr)
-  } else if (
-    recipient &&
-    // Guard transitions — forward-only on the success ladder, and
-    // `failed` only from pre-delivered states.
-    isValidStatusTransition(recipient.status, status.status)
-  ) {
-    const update: Record<string, unknown> = { status: status.status }
-    if (status.status === 'sent' && !('sent_at' in update)) update.sent_at = tsIso
-    if (status.status === 'delivered') update.delivered_at = tsIso
-    if (status.status === 'read') update.read_at = tsIso
-    // broadcast_recipients already has a free-text error_message column
-    // (migration 001), so the reason is folded into it rather than
-    // adding three more columns there.
-    if (failure) {
-      update.error_message =
-        `[${failure.code}] ${failure.title}` +
-        (failure.details ? `: ${failure.details}` : '')
-    }
-
-    const { error: recUpdateErr } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .update(update)
-      .eq('id', recipient.id)
-
-    if (recUpdateErr) {
-      console.error('Error updating broadcast recipient status:', recUpdateErr)
-    }
-  }
+  await applyBroadcastRecipientStatus(supabaseAdmin(), {
+    whatsappMessageId: status.id,
+    status: status.status,
+    occurredAt: new Date(parseInt(status.timestamp) * 1000).toISOString(),
+    failure,
+  })
 
   // 3) Webhook fan-out for messages we store (inbox / API sends).
   //    Runs last so a slow subscriber can't delay the mirrors above.
-  //    Bounded to one row (message_id isn't unique) purely to resolve
-  //    the owning account for delivery.
-  const { data: msgRow } = await supabaseAdmin()
-    .from('messages')
-    .select('conversation_id, conversations(account_id)')
-    .eq('message_id', status.id)
-    .limit(1)
-    .maybeSingle()
-
-  if (msgRow) {
-    const conv = msgRow.conversations as { account_id: string } | null
-    const accountId = conv?.account_id
-    if (accountId) {
-      await dispatchWebhookEvent(
-        supabaseAdmin(),
-        accountId,
-        'message.status_updated',
-        {
-          whatsapp_message_id: status.id,
-          conversation_id: msgRow.conversation_id,
-          status: status.status,
-        }
-      )
-    }
+  if (!accountId) return
+  for (const advanced of advancedMessages) {
+    await dispatchWebhookEvent(
+      supabaseAdmin(),
+      accountId,
+      'message.status_updated',
+      {
+        whatsapp_message_id: status.id,
+        conversation_id: advanced.conversation_id,
+        status: status.status,
+      }
+    )
   }
 }
 
 /**
- * If an inbound message's sender is on a still-unreplied
- * broadcast_recipients row, flip it to `replied` so the reply count
- * advances on the parent broadcast.
+ * Flip the contact's most recent broadcast recipient row to `replied`
+ * when it was sent within the reply window and isn't already replied.
  *
  * Runs on a best-effort basis — failures here must not break the
  * main inbound-message flow, so errors are swallowed with a log.
  */
 async function flagBroadcastReplyIfAny(accountId: string, contactId: string) {
   try {
-    // Most recent outbound broadcast in this account that hasn't
-    // been replied to yet. Account-scoped so a shared inbox reply
-    // marks the broadcast as replied regardless of which teammate
-    // sent it.
-    const { data: recs, error } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .select('id, status, broadcast_id, broadcasts!inner(account_id)')
-      .eq('contact_id', contactId)
-      .eq('broadcasts.account_id', accountId)
-      .in('status', ['sent', 'delivered', 'read'])
-      .order('created_at', { ascending: false })
-      .limit(1)
-
-    if (error || !recs || recs.length === 0) return
-
-    const row = recs[0]
-    const { error: updErr } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .update({ status: 'replied', replied_at: new Date().toISOString() })
-      .eq('id', row.id)
-
-    if (updErr) {
-      console.error('Error marking broadcast recipient replied:', updErr)
-    }
+    await flagBroadcastReply(supabaseAdmin(), accountId, contactId)
   } catch (err) {
     console.error('flagBroadcastReplyIfAny failed:', err)
   }
@@ -792,12 +711,19 @@ async function processMessage(
   }
 
   // Parse message content based on type
-  const { contentText, mediaUrl, mediaType, interactiveReplyId } =
-    await parseMessageContent(
-      message,
-      accessToken,
-      mirrorMedia ? { accountId } : null
-    )
+  const {
+    contentText,
+    mediaUrl,
+    mediaType,
+    interactiveReplyId,
+    errorCode,
+    errorTitle,
+    errorDetails,
+  } = await parseMessageContent(
+    message,
+    accessToken,
+    mirrorMedia ? { accountId } : null
+  )
 
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
@@ -838,16 +764,7 @@ async function processMessage(
         ? 'interactive' // template quick-reply tap (issue #478)
         : 'text'        // reaction, unknown → text fallback
 
-  // Determine whether this is the contact's very first inbound message
-  // BEFORE we insert, so the count is accurate. Covers the case where
-  // the contact row already exists (manual add / CSV import) but they've
-  // never messaged us before — which new_contact_created wouldn't catch.
-  const { count: priorCustomerMsgCount } = await supabaseAdmin()
-    .from('messages')
-    .select('id', { count: 'exact', head: true })
-    .eq('conversation_id', conversation.id)
-    .eq('sender_type', 'customer')
-  const isFirstInboundMessage = (priorCustomerMsgCount ?? 0) === 0
+  const receivedAt = new Date(parseInt(message.timestamp) * 1000).toISOString()
 
   // Idempotent insert. Meta retries webhook deliveries (a slow ack, a
   // transient 5xx), and each retry replays the exact same message.id. The
@@ -873,12 +790,20 @@ async function processMessage(
         media_type: mediaType,
         message_id: message.id,
         status: 'delivered',
-        created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
+        created_at: receivedAt,
         reply_to_message_id: replyToInternalId,
         // Only populated for content_type='interactive'. Migration 010 added
         // the column; null for every other content_type so existing inserts
         // behave identically.
         interactive_reply_id: interactiveReplyId,
+        // Non-null only for a `type: 'unsupported'` delivery, where they
+        // hold Meta's reason. Inbound rows are never status='failed', so
+        // the thread's delivery-failure banner (which gates on that) is
+        // unaffected; these are here so the reason survives and can be
+        // queried.
+        error_code: errorCode,
+        error_title: errorTitle,
+        error_details: errorDetails,
       },
       { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
     )
@@ -900,6 +825,12 @@ async function processMessage(
     )
     return
   }
+
+  const isFirstInboundMessage = await claimFirstInboundMessage(
+    supabaseAdmin(),
+    conversation,
+    receivedAt
+  )
 
   // Update conversation. The unread bump is done DB-side (migration 037's
   // bump_conversation_on_inbound) rather than as a read-modify-write of the
@@ -978,6 +909,28 @@ async function processMessage(
   // Fire-and-forget: a slow or failing automation must not block the
   // webhook's 200 OK response to Meta.
   const inboundText = contentText ?? message.text?.body ?? ''
+
+  // An automation parked at a "wait for reply" Send Buttons / Send List
+  // step takes this message as its reply — a tap or typed text — and
+  // continues from the step after the send. Like a Flow consuming the
+  // message, that suppresses the content-level triggers and AI reply
+  // below so the customer doesn't get a second bot answering. Runs
+  // BEFORE the trigger dispatch so the message that parks a run can
+  // never also resume it. Flows still win: only checked if no flow
+  // consumed the message. Never throws.
+  const automationConsumed = flowConsumed
+    ? false
+    : await resumeAwaitingReply({
+        accountId,
+        contactId: contactRecord.id,
+        context: {
+          message_text: inboundText,
+          conversation_id: conversation.id,
+          interactive_reply_id: interactiveReplyId ?? undefined,
+        },
+      })
+  const contentConsumed = flowConsumed || automationConsumed
+
   const automationTriggers: (
     | 'new_contact_created'
     | 'first_inbound_message'
@@ -985,9 +938,9 @@ async function processMessage(
     | 'keyword_match'
     | 'interactive_reply'
   )[] = []
-  // Content-level triggers are suppressed when a flow consumed the
-  // message — see the comment block above.
-  if (!flowConsumed) {
+  // Content-level triggers are suppressed when a flow or a waiting
+  // automation consumed the message — see the comment blocks above.
+  if (!contentConsumed) {
     automationTriggers.push('new_message_received', 'keyword_match')
     // Interactive tap → fire the interactive_reply trigger too (only
     // meaningful when a button/list reply actually arrived). Enables
@@ -1033,7 +986,7 @@ async function processMessage(
   // the account has enabled it. Awaited inside `after()` (same reason as
   // the webhook dispatch below); `dispatchInboundToAiReply` owns its
   // eligibility gates + try/catch and never throws.
-  if (!flowConsumed && !interactiveReplyId && inboundText.trim()) {
+  if (!contentConsumed && !interactiveReplyId && inboundText.trim()) {
     await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
@@ -1079,6 +1032,16 @@ async function parseMessageContent(
    * tap with the right affordance. Null for everything else.
    */
   interactiveReplyId: string | null
+  /**
+   * Meta's account of a message it could not hand over, from the
+   * `errors[0]` on a `type: 'unsupported'` delivery. All three are null
+   * for every type we understand. Persisted to `messages.error_code` /
+   * `error_title` / `error_details` — the columns migration 042 added for
+   * failed outbound statuses, which hold the same shape of data.
+   */
+  errorCode: number | null
+  errorTitle: string | null
+  errorDetails: string | null
 }> {
   // getMediaUrl signature is (mediaId, accessToken) — earlier code had
   // the args swapped, so every verification hit an invalid Meta URL and
@@ -1131,11 +1094,24 @@ async function parseMessageContent(
 
   // Default shape — each case overrides only the fields it cares about.
   // Keeps the new `interactiveReplyId` field DRY across every return site.
-  const empty = {
+  const empty: {
+    contentText: string | null
+    mediaUrl: string | null
+    mediaType: string | null
+    interactiveReplyId: string | null
+    errorCode: number | null
+    errorTitle: string | null
+    errorDetails: string | null
+  } = {
     contentText: null,
     mediaUrl: null,
     mediaType: null,
     interactiveReplyId: null,
+    // Only the `unsupported` fallback below fills these in; every other
+    // type leaves them null, exactly as before.
+    errorCode: null,
+    errorTitle: null,
+    errorDetails: null,
   }
 
   switch (message.type) {
@@ -1259,11 +1235,30 @@ async function parseMessageContent(
       }
     }
 
-    default:
+    default: {
+      // Meta hands over `type: 'unsupported'` when WhatsApp itself cannot
+      // represent what the customer sent — a view-once photo, a poll, a
+      // disappearing message, or anything from an old or unofficial build.
+      // No content comes with it and there is no endpoint to fetch it
+      // later, so `errors[0]` is the only account of what happened. It was
+      // dropped here, leaving agents with a bare "[Unsupported message
+      // type: unsupported]" and nothing to act on. Keep the reason both in
+      // the visible text and in the same three columns a failed outbound
+      // status uses, so it is readable and queryable (issue #535 added
+      // them for exactly this kind of loss).
+      const reason = message.errors?.[0]
+      const detail =
+        reason?.error_data?.details || reason?.message || reason?.title
       return {
         ...empty,
-        contentText: `[Unsupported message type: ${message.type}]`,
+        contentText: detail
+          ? `[Unsupported message type: ${message.type} — ${detail}]`
+          : `[Unsupported message type: ${message.type}]`,
+        errorCode: reason?.code ?? null,
+        errorTitle: reason?.title ?? null,
+        errorDetails: reason?.error_data?.details ?? reason?.message ?? null,
       }
+    }
   }
 }
 
@@ -1361,10 +1356,7 @@ async function findOrCreateContact(
     ? await findContactByWaUserId(accountId, identity.waUserId)
     : null
 
-  // Fall back to the phone. The shared helper pre-filters in SQL by the
-  // last-8-digit suffix (so we don't pull every contact on every
-  // inbound message) then applies the strict `phonesMatch` in JS on the
-  // small candidate set. The same helper backs the manual contact form
+  // Fall back to the phone. The same helper backs the manual contact form
   // and CSV import, so all three paths agree on what "same number"
   // means (issue #212).
   if (!existingContact && identity.phone) {

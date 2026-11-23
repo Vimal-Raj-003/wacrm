@@ -4,13 +4,16 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
+import { notificationsAccountFilter } from "@/lib/notifications/unread-count";
 import type { Notification } from "@/types";
 import { Bell, CheckCheck, Loader2, UserPlus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
+import { getDateLocale } from "@/i18n/date-locale";
+import { notificationText } from "@/lib/notifications/notification-text";
 
 // Icon per notification type. Only one type exists today
 // (conversation_assigned) but this keeps future types a one-line add.
@@ -20,12 +23,15 @@ const TYPE_ICON: Record<Notification["type"], typeof Bell> = {
 
 export default function NotificationsPage() {
   const t = useTranslations("Notifications");
+  const dateLocale = getDateLocale(useLocale());
   const router = useRouter();
   const { accountId } = useAuth();
   const [notifications, setNotifications] = useState<Notification[] | null>(
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  const [actorNames, setActorNames] = useState<Record<string, string>>({});
+  const [contactNames, setContactNames] = useState<Record<string, string>>({});
   const [markingAll, setMarkingAll] = useState(false);
 
   const load = useCallback(async () => {
@@ -41,7 +47,23 @@ export default function NotificationsPage() {
       setError(fetchErr.message);
       return;
     }
-    setNotifications((data ?? []) as Notification[]);
+    const rows = (data ?? []) as Notification[];
+    const actorIds = [...new Set(rows.flatMap((row) => row.actor_user_id ? [row.actor_user_id] : []))];
+    const contactIds = [...new Set(rows.flatMap((row) => row.contact_id ? [row.contact_id] : []))];
+    // The database stores English notification copy. Resolve the structured
+    // references so the UI can translate it while preserving people's names.
+    const [actors, contacts] = await Promise.all([
+      actorIds.length
+        ? supabase.from("profiles").select("user_id, full_name").eq("account_id", accountId).in("user_id", actorIds)
+        : Promise.resolve({ data: [] }),
+      contactIds.length
+        ? supabase.from("contacts").select("id, name, phone").eq("account_id", accountId).in("id", contactIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+    setActorNames(Object.fromEntries((actors.data ?? []).map((row) => [row.user_id, row.full_name?.trim() || ""])));
+    setContactNames(Object.fromEntries((contacts.data ?? []).map((row) => [row.id, row.name?.trim() || row.phone || ""])));
+    setError(null);
+    setNotifications(rows);
   }, [accountId]);
 
   useEffect(() => {
@@ -52,12 +74,18 @@ export default function NotificationsPage() {
   // Realtime — new assignments appear without a refresh, and a
   // "mark all read" fired from another tab/device stays in sync here.
   useEffect(() => {
+    if (!accountId) return;
     const supabase = createClient();
     const channel = supabase
-      .channel("notifications-page")
+      .channel(`notifications-page:${accountId}`)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "notifications" },
+        {
+          event: "*",
+          schema: "public",
+          table: "notifications",
+          filter: notificationsAccountFilter(accountId),
+        },
         (payload) => {
           if (payload.eventType === "INSERT") {
             const row = payload.new as Notification;
@@ -66,6 +94,7 @@ export default function NotificationsPage() {
               if (prev.some((n) => n.id === row.id)) return prev;
               return [row, ...prev];
             });
+            void load();
           } else if (payload.eventType === "UPDATE") {
             const row = payload.new as Notification;
             setNotifications((prev) =>
@@ -85,7 +114,7 @@ export default function NotificationsPage() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [accountId, load]);
 
   const markRead = useCallback(
     async (id: string) => {
@@ -126,7 +155,7 @@ export default function NotificationsPage() {
   const unreadIds = notifications?.filter((n) => !n.read_at).map((n) => n.id) ?? [];
 
   const markAllRead = useCallback(async () => {
-    if (unreadIds.length === 0) return;
+    if (unreadIds.length === 0 || !accountId) return;
     setMarkingAll(true);
     const now = new Date().toISOString();
     setNotifications(
@@ -136,13 +165,14 @@ export default function NotificationsPage() {
     const { error: updateErr } = await supabase
       .from("notifications")
       .update({ read_at: now })
+      .eq("account_id", accountId)
       .is("read_at", null);
     setMarkingAll(false);
     if (updateErr) {
       toast.error(t("markAllFailed"));
       load();
     }
-  }, [unreadIds.length, load, t]);
+  }, [unreadIds.length, accountId, load, t]);
 
   if (error) {
     return (
@@ -204,6 +234,10 @@ export default function NotificationsPage() {
           {notifications.map((n) => {
             const Icon = TYPE_ICON[n.type] ?? Bell;
             const isUnread = !n.read_at;
+            const copy = notificationText(n, {
+              actor: n.actor_user_id ? actorNames[n.actor_user_id] : undefined,
+              contact: n.contact_id ? contactNames[n.contact_id] : undefined,
+            }, t);
             return (
               <li key={n.id}>
                 <button
@@ -238,7 +272,7 @@ export default function NotificationsPage() {
                           isUnread ? "text-foreground" : "text-muted-foreground",
                         )}
                       >
-                        {n.title}
+                        {copy.title}
                       </span>
                       {isUnread && (
                         <span
@@ -247,13 +281,14 @@ export default function NotificationsPage() {
                         />
                       )}
                     </div>
-                    {n.body && (
+                    {copy.body && (
                       <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                        {n.body}
+                        {copy.body}
                       </p>
                     )}
                     <p className="mt-1 text-[11px] text-muted-foreground/70">
                       {formatDistanceToNow(new Date(n.created_at), {
+                        locale: dateLocale,
                         addSuffix: true,
                       })}
                     </p>

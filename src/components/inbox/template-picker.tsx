@@ -29,7 +29,10 @@ import {
   Search,
   AlertTriangle,
 } from "lucide-react";
-import { extractVariableIndices } from "@/lib/whatsapp/template-validators";
+import {
+  extractTemplateVariables,
+  extractVariableIndices,
+} from "@/lib/whatsapp/template-validators";
 import {
   MEDIA_HEADER_SPECS,
   isMediaHeaderKind,
@@ -60,10 +63,10 @@ interface TemplatePickerProps {
 }
 
 function renderBodyPreview(body: string, params: string[]): string {
-  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
-    const idx = Number(raw) - 1;
-    const value = params[idx];
-    return value && value.trim().length > 0 ? value : `{{${raw}}}`;
+  const keys = extractTemplateVariables(body);
+  return body.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (match, key: string) => {
+    const value = params[keys.indexOf(key)];
+    return value && value.trim().length > 0 ? value : match;
   });
 }
 
@@ -88,16 +91,19 @@ interface UrlButtonSlot {
  * body variables, a text-header variable, and per-URL-button suffixes.
  */
 function collectVariableSlots(template: MessageTemplate): {
-  bodyVars: number[];
-  headerVarCount: number;
+  bodyVars: string[];
+  headerVar: string | null;
   mediaHeaderKind: MediaHeaderKind | null;
   urlButtonSlots: UrlButtonSlot[];
 } {
-  const bodyVars = extractVariableIndices(template.body_text);
-  const headerVarCount =
+  // Positional ({{1}}) or named ({{customer_name}}) — see
+  // extractTemplateVariables. Missing a named variable here means the
+  // send goes out with no parameters and Meta rejects it (#132000).
+  const bodyVars = extractTemplateVariables(template.body_text);
+  const headerVar =
     template.header_type === "text" && template.header_content
-      ? extractVariableIndices(template.header_content).length
-      : 0;
+      ? (extractTemplateVariables(template.header_content)[0] ?? null)
+      : null;
   const mediaHeaderKind =
     template.header_type && isMediaHeaderKind(template.header_type)
       ? template.header_type
@@ -108,7 +114,7 @@ function collectVariableSlots(template: MessageTemplate): {
       urlButtonSlots.push({ index: i, text: b.text, url: b.url });
     }
   });
-  return { bodyVars, headerVarCount, mediaHeaderKind, urlButtonSlots };
+  return { bodyVars, headerVar, mediaHeaderKind, urlButtonSlots };
 }
 
 export function TemplatePicker({
@@ -336,7 +342,7 @@ export function TemplatePicker({
     !uploadingMedia &&
     mediaHeaderSatisfied &&
     slots.bodyVars.every((_, i) => (params[i] ?? "").trim().length > 0) &&
-    (slots.headerVarCount === 0 || headerText.trim().length > 0) &&
+    (slots.headerVar === null || headerText.trim().length > 0) &&
     slots.urlButtonSlots.every(
       (s) => (buttonParams[s.index] ?? "").trim().length > 0,
     );
@@ -522,7 +528,6 @@ export function TemplatePicker({
                 </div>
               )}
             </div>
-
             {/* Media / PDF Document Header Attachment */}
             {slots?.mediaHeaderKind && (
               <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
@@ -603,10 +608,10 @@ export function TemplatePicker({
               </div>
             )}
 
-            {slots && slots.headerVarCount > 0 && (
+            {slots?.headerVar && (
               <div className="space-y-1">
                 <Label className="text-xs text-popover-foreground">
-                  {`Header {{1}}`}
+                  {t("headerVarLabel", { var: `{{${slots.headerVar}}}` })}
                 </Label>
                 <Input
                   value={headerText}
@@ -620,7 +625,9 @@ export function TemplatePicker({
             {slots?.bodyVars.map((v, i) => (
               <div key={v} className="space-y-1">
                 <div className="flex flex-wrap items-center justify-between gap-1">
-                  <Label className="text-xs text-popover-foreground">{`Body {{${v}}}`}</Label>
+                  <Label className="text-xs text-popover-foreground">
+                    {t("bodyVarLabel", { var: `{{${v}}}` })}
+                  </Label>
                   {contactQuickFills.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {contactQuickFills.map((qf) => (
@@ -656,8 +663,7 @@ export function TemplatePicker({
             {slots?.urlButtonSlots.map((slot) => (
               <div key={slot.index} className="space-y-1">
                 <Label className="text-xs text-popover-foreground">
-                  {`URL button "${slot.text}" — value for `}
-                  {`{{1}}`}
+                  {t("urlButtonVarLabel", { text: slot.text, var: "{{1}}" })}
                 </Label>
                 <Input
                   value={buttonParams[slot.index] ?? ""}
