@@ -27,6 +27,7 @@ import {
   RefreshCw,
   PanelRightOpen,
   PanelRightClose,
+  MessageSquarePlus,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -45,15 +46,15 @@ import { MediaLightbox } from "./media-lightbox";
 import { collectMediaGallery } from "@/lib/media/gallery";
 import {
   MessageComposer,
-  CHAT_MEDIA_BUCKET,
   type SendMediaPayload,
 } from "./message-composer";
-import { deleteAccountMedia } from "@/lib/storage/upload-media";
-import { TemplatePicker } from "./template-picker";
+import { TemplatePicker, type TemplateSendValues } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { renderTemplateBody } from "@/lib/whatsapp/template-body";
 import { contactHandle } from "@/lib/whatsapp/wa-identity";
+import { isOutside24HourWindowError } from "@/lib/whatsapp/retry-policy";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
 interface ReplyDraft {
@@ -106,6 +107,8 @@ interface MessageThreadProps {
    */
   contactPanelOpen?: boolean;
   onToggleContactPanel?: () => void;
+  /** Opens the New Chat dialog from the empty state. */
+  onNewChat?: () => void;
 }
 
 function formatDateSeparator(dateStr: string, t: ReturnType<typeof useTranslations>): string {
@@ -164,6 +167,7 @@ export function MessageThread({
   onRefresh,
   contactPanelOpen,
   onToggleContactPanel,
+  onNewChat,
 }: MessageThreadProps) {
   const t = useTranslations("Inbox.messageThread");
   const tTimer = useTranslations("Inbox.sessionTimer");
@@ -176,6 +180,15 @@ export function MessageThread({
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [reactions, setReactions] = useState<MessageReaction[]>([]);
+  // Tracks which failed messages are currently retrying so we show
+  // "Retrying…" and prevent duplicate concurrent retry requests.
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(() => new Set());
+  // Stores original `/api/whatsapp/send` payloads for failed optimistic
+  // messages (`temp-...`) so the agent can retry immediately without
+  // retyping or re-uploading.
+  const retryPayloadsRef = useRef<Map<string, Record<string, unknown>>>(
+    new Map(),
+  );
   // Purely visual spin state for the manual-refresh button. The actual
   // refetch is fire-and-forget through `onRefresh` (which bumps the
   // parent's resyncToken); the 700ms spin is just feedback so the click
@@ -232,9 +245,14 @@ export function MessageThread({
     };
   }, []);
 
-  // 24-hour session timer
+  // 24-hour session timer (official WhatsApp Business Platform rule).
+  // A brand-new conversation with 0 messages has NO inbound customer
+  // message yet, so free-form messaging is locked until an approved
+  // template initiates the chat and the customer replies.
   const sessionInfo = useMemo(() => {
-    if (!messages.length) return { expired: false, remaining: "" };
+    if (!messages.length) {
+      return { expired: true, remaining: tTimer("noCustomerMessages") };
+    }
 
     // Find last customer message
     const lastCustomerMsg = [...messages]
@@ -484,16 +502,18 @@ export function MessageThread({
       onNewMessage(optimisticMsg);
       setReplyTo(null);
 
+      const requestBody: Record<string, unknown> = {
+        conversation_id: conversation.id,
+        message_type: "text",
+        content_text: text,
+        reply_to_message_id: replyToId,
+      };
+
       try {
         const res = await fetch("/api/whatsapp/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: "text",
-            content_text: text,
-            reply_to_message_id: replyToId,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         const payload = await res.json().catch(() => ({}));
@@ -502,20 +522,23 @@ export function MessageThread({
           const reason = payload?.error || `HTTP ${res.status}`;
           console.error("Failed to send message:", reason);
           toast.error(t("sendFailed", { reason }));
+          retryPayloadsRef.current.set(tempId, requestBody);
           // Mark the optimistic bubble as failed so the user sees what happened
-          onUpdateMessage(tempId, { status: "failed" });
+          onUpdateMessage(tempId, { status: "failed", error_title: reason });
           return;
         }
 
+        retryPayloadsRef.current.delete(tempId);
         // Success — the realtime INSERT event will replace the temp bubble
         // with the real DB row. If realtime hasn't arrived yet, at least
         // flip status to 'sent' so the UI stops showing "sending".
-        onUpdateMessage(tempId, { status: "sent" });
+        onUpdateMessage(tempId, { status: "sent", error_title: null });
       } catch (err) {
         console.error("Failed to send message:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(t("sendFailed", { reason }));
-        onUpdateMessage(tempId, { status: "failed" });
+        retryPayloadsRef.current.set(tempId, requestBody);
+        onUpdateMessage(tempId, { status: "failed", error_title: reason });
       }
     },
     [conversation, onNewMessage, onUpdateMessage, t]
@@ -548,18 +571,20 @@ export function MessageThread({
       onNewMessage(optimisticMsg);
       setReplyTo(null);
 
+      const requestBody: Record<string, unknown> = {
+        conversation_id: conversation.id,
+        message_type: payload.kind,
+        media_url: payload.mediaUrl,
+        content_text: contentText,
+        filename: payload.filename,
+        reply_to_message_id: payload.replyToId,
+      };
+
       try {
         const res = await fetch("/api/whatsapp/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: payload.kind,
-            media_url: payload.mediaUrl,
-            content_text: contentText,
-            filename: payload.filename,
-            reply_to_message_id: payload.replyToId,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         const data = await res.json().catch(() => ({}));
@@ -568,20 +593,21 @@ export function MessageThread({
           const reason = data?.error || `HTTP ${res.status}`;
           console.error("Failed to send media:", reason);
           toast.error(t("sendFailed", { reason }));
-          onUpdateMessage(tempId, { status: "failed" });
-          // The upload never reached the recipient — GC the orphaned
-          // object rather than leaving it in the public bucket forever.
-          void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
+          // Keep payload cached so the agent can immediately click Retry
+          // without re-uploading the PDF/file.
+          retryPayloadsRef.current.set(tempId, requestBody);
+          onUpdateMessage(tempId, { status: "failed", error_title: reason });
           return;
         }
 
-        onUpdateMessage(tempId, { status: "sent" });
+        retryPayloadsRef.current.delete(tempId);
+        onUpdateMessage(tempId, { status: "sent", error_title: null });
       } catch (err) {
         console.error("Failed to send media:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(t("sendFailed", { reason }));
-        onUpdateMessage(tempId, { status: "failed" });
-        void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
+        retryPayloadsRef.current.set(tempId, requestBody);
+        onUpdateMessage(tempId, { status: "failed", error_title: reason });
       }
     },
     [conversation, onNewMessage, onUpdateMessage, t],
@@ -662,11 +688,7 @@ export function MessageThread({
   const handleSendTemplate = useCallback(
     async (
       template: MessageTemplate,
-      values: {
-        body: string[];
-        headerText?: string;
-        buttonParams?: Record<number, string>;
-      },
+      values: TemplateSendValues,
     ) => {
       if (!conversation) return;
 
@@ -679,33 +701,34 @@ export function MessageThread({
         sender_type: "agent",
         content_type: "template",
         content_text: renderedBody,
+        media_url: values.headerMediaUrl || template.header_media_url || undefined,
         template_name: template.name,
         status: "sending",
         created_at: new Date().toISOString(),
       };
       onNewMessage(optimisticMsg);
 
+      const requestBody: Record<string, unknown> = {
+        conversation_id: conversation.id,
+        message_type: "template",
+        template_name: template.name,
+        template_language: template.language,
+        template_message_params: {
+          body: values.body,
+          headerText: values.headerText,
+          headerMediaUrl: values.headerMediaUrl,
+          headerDocumentFilename: values.headerDocumentFilename,
+          buttonParams: values.buttonParams,
+        },
+        template_params: values.body,
+        content_text: renderedBody,
+      };
+
       try {
         const res = await fetch("/api/whatsapp/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: "template",
-            template_name: template.name,
-            template_language: template.language,
-            // Structured params drive the new send-builder path
-            // (header media + URL button substitution). Body values
-            // are mirrored under both shapes so the route can fall
-            // back if the template row isn't found locally.
-            template_message_params: {
-              body: values.body,
-              headerText: values.headerText,
-              buttonParams: values.buttonParams,
-            },
-            template_params: values.body,
-            content_text: renderedBody,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         const payload = await res.json().catch(() => ({}));
@@ -714,19 +737,114 @@ export function MessageThread({
           const reason = payload?.error || `HTTP ${res.status}`;
           console.error("Failed to send template:", reason);
           toast.error(t("sendTemplateFailed", { reason }));
-          onUpdateMessage(tempId, { status: "failed" });
+          retryPayloadsRef.current.set(tempId, requestBody);
+          onUpdateMessage(tempId, { status: "failed", error_title: reason });
           return;
         }
 
-        onUpdateMessage(tempId, { status: "sent" });
+        retryPayloadsRef.current.delete(tempId);
+        onUpdateMessage(tempId, { status: "sent", error_title: null });
       } catch (err) {
         console.error("Failed to send template:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(t("sendTemplateFailed", { reason }));
-        onUpdateMessage(tempId, { status: "failed" });
+        retryPayloadsRef.current.set(tempId, requestBody);
+        onUpdateMessage(tempId, { status: "failed", error_title: reason });
       }
     },
     [conversation, onNewMessage, onUpdateMessage, t],
+  );
+
+  // Manual immediate retry for any failed outbound message (both
+  // optimistic temp messages and persisted DB messages), while strictly
+  // respecting WhatsApp's 24-hour customer service window and preventing
+  // duplicate sends.
+  const handleRetryMessage = useCallback(
+    async (msg: Message) => {
+      if (retryingIds.has(msg.id)) return;
+
+      // Enforce 24-hour window client-side too for non-template retries.
+      if (
+        msg.content_type !== "template" &&
+        (sessionInfo.expired ||
+          isOutside24HourWindowError(msg.error_code, msg.error_details ?? msg.error_title))
+      ) {
+        toast.error(
+          "24-hour customer service window expired. Please send an approved WhatsApp template instead.",
+        );
+        setTemplateModalOpen(true);
+        return;
+      }
+
+      setRetryingIds((prev) => {
+        const next = new Set(prev);
+        next.add(msg.id);
+        return next;
+      });
+      onUpdateMessage(msg.id, { status: "sending" });
+
+      try {
+        if (msg.id.startsWith("temp-")) {
+          const cached = retryPayloadsRef.current.get(msg.id);
+          if (!cached) {
+            toast.error("Original message payload unavailable — please resend.");
+            onUpdateMessage(msg.id, { status: "failed" });
+            return;
+          }
+          const res = await fetch("/api/whatsapp/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(cached),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const reason = data?.error || `HTTP ${res.status}`;
+            toast.error(t("sendFailed", { reason }));
+            onUpdateMessage(msg.id, { status: "failed", error_title: reason });
+            return;
+          }
+          retryPayloadsRef.current.delete(msg.id);
+          onUpdateMessage(msg.id, { status: "sent", error_title: null });
+          toast.success("Message resent successfully");
+          return;
+        }
+
+        // Persisted DB failed message — call atomic retry endpoint.
+        const res = await fetch("/api/whatsapp/retry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message_id: msg.id }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const reason = data?.error || `HTTP ${res.status}`;
+          toast.error(reason);
+          if (data?.code === "window_expired") {
+            setTemplateModalOpen(true);
+          }
+          onUpdateMessage(msg.id, { status: "failed", error_title: reason });
+          return;
+        }
+        onUpdateMessage(msg.id, {
+          status: "sent",
+          error_code: null,
+          error_title: null,
+          error_details: null,
+        });
+        toast.success("Message resent successfully");
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(t("sendFailed", { reason }));
+        onUpdateMessage(msg.id, { status: "failed", error_title: reason });
+      } finally {
+        setRetryingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(msg.id);
+          return next;
+        });
+      }
+    },
+    [retryingIds, sessionInfo.expired, onUpdateMessage, t],
   );
 
   // Build a quick id → Message map so reply quotes can be rendered without
@@ -877,6 +995,17 @@ export function MessageThread({
         <p className="mt-1 text-xs text-muted-foreground">
           {t("selectConversationHint")}
         </p>
+        {onNewChat && (
+          <Button
+            type="button"
+            size="sm"
+            onClick={onNewChat}
+            className="mt-4 gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            <MessageSquarePlus className="h-4 w-4" />
+            New WhatsApp Chat
+          </Button>
+        )}
       </div>
     );
   }
@@ -1149,6 +1278,17 @@ export function MessageThread({
                           currentUserId={user?.id}
                           onToggleReaction={handlePillToggle}
                           onOpenMedia={handleMediaChange}
+                          onRetry={handleRetryMessage}
+                          isRetrying={retryingIds.has(msg.id)}
+                          retryBlockedByWindow={
+                            msg.content_type !== "template" &&
+                            (sessionInfo.expired ||
+                              isOutside24HourWindowError(
+                                msg.error_code,
+                                msg.error_details ?? msg.error_title,
+                              ))
+                          }
+                          onOpenTemplates={handleOpenTemplates}
                         />
                       </MessageActions>
                     );
@@ -1192,6 +1332,7 @@ export function MessageThread({
         open={templateModalOpen}
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
+        contact={contact}
       />
 
       {/* Full-size viewer for the thread's images/videos. Renders nothing

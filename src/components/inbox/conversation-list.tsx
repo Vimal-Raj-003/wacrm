@@ -9,10 +9,12 @@ import {
 } from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag } from "@/types";
-import { Search, ChevronDown, X } from "lucide-react";
+import { Search, ChevronDown, X, MessageSquarePlus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Input } from "@/components/ui/input";
+import { GatedButton } from "@/components/ui/gated-button";
+import { useCan } from "@/hooks/use-can";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -34,6 +36,8 @@ interface ConversationListProps {
    * or the tab was throttled. Optional so existing callers keep working.
    */
   resyncToken?: number;
+  /** Opens the New Chat modal to initiate a 1-to-1 WhatsApp conversation. */
+  onNewChat?: () => void;
 }
 
 const STATUS_COLORS: Record<ConversationStatus, string> = {
@@ -52,8 +56,10 @@ export function ConversationList({
   conversations,
   onConversationsLoaded,
   resyncToken = 0,
+  onNewChat,
 }: ConversationListProps) {
   const t = useTranslations("Inbox.conversationList");
+  const canSend = useCan("send-messages");
   
   const FILTER_OPTIONS: { label: string; value: InboxFilter }[] = useMemo(() => [
     { label: t("filterAll"), value: "all" },
@@ -224,16 +230,32 @@ export function ConversationList({
     // the single pane showing; fixed 320px on desktop where it shares the
     // row with the thread + contact sidebar.
     <div className="flex h-full w-full flex-col border-r border-border bg-card lg:w-80">
-      {/* Search + Filter */}
+      {/* Search + New Chat + Filter */}
       <div className="space-y-2 border-b border-border p-3">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={handleSearchChange}
-            placeholder={t("searchPlaceholder")}
-            className="border-border bg-muted pl-9 text-sm text-foreground placeholder-muted-foreground focus:border-primary/50"
-          />
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={handleSearchChange}
+              placeholder={t("searchPlaceholder")}
+              className="border-border bg-muted pl-9 text-sm text-foreground placeholder-muted-foreground focus:border-primary/50"
+            />
+          </div>
+          {onNewChat && (
+            <GatedButton
+              type="button"
+              size="icon"
+              canAct={canSend}
+              gateReason="start new conversations"
+              onClick={onNewChat}
+              title="New WhatsApp Chat"
+              aria-label="New WhatsApp Chat"
+              className="h-9 w-9 shrink-0 bg-primary text-primary-foreground hover:bg-primary/90"
+            >
+              <MessageSquarePlus className="h-4 w-4" />
+            </GatedButton>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-1">

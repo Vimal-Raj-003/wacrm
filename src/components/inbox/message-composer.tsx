@@ -22,6 +22,10 @@ import {
   Plus,
   MessageSquareDashed,
   Zap,
+  Eye,
+  AlertTriangle,
+  CheckCircle2,
+  Wand2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { GatedButton } from "@/components/ui/gated-button";
@@ -55,6 +59,11 @@ import {
 import { validateInteractivePayload } from "@/lib/whatsapp/interactive";
 import type { InteractiveMessagePayload, QuickReply } from "@/types";
 import { QuickReplyPicker } from "./quick-reply-picker";
+import {
+  analyzeOutgoingMessage,
+  optimizeMessageSpacing,
+  WHATSAPP_READ_MORE_CHAR_THRESHOLD,
+} from "@/lib/whatsapp/message-formatting";
 
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
@@ -154,6 +163,9 @@ export function MessageComposer({
     useState<InteractiveMessagePayload>(blankButtonsPayload);
   const [savingQuickReply, setSavingQuickReply] = useState(false);
   const [quickReplyOpen, setQuickReplyOpen] = useState(false);
+  // Pre-send message preview dialog — lets agents check WhatsApp fold
+  // risk ("Read more") and formatting before sending.
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   // Media attachment state. `draft` holds an uploaded-but-not-yet-sent
   // attachment; `busy` covers the upload/transcode window.
@@ -228,6 +240,7 @@ export function MessageComposer({
     try {
       onSend(trimmed, replyTo?.id);
       setText("");
+      setPreviewOpen(false);
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
       }
@@ -235,6 +248,13 @@ export function MessageComposer({
       setSending(false);
     }
   }, [text, sending, sessionExpired, onSend, replyTo?.id]);
+
+  const formattingAnalysis = analyzeOutgoingMessage(text);
+
+  const handleOptimizeSpacing = useCallback(() => {
+    setText((prev) => optimizeMessageSpacing(prev));
+    requestAnimationFrame(() => adjustHeight());
+  }, [adjustHeight]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -750,6 +770,19 @@ export function MessageComposer({
             )}
           />
 
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={!text.trim() || sessionExpired || readOnly}
+            onClick={() => setPreviewOpen(true)}
+            title="Preview message before sending"
+            aria-label="Preview message"
+            className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground disabled:opacity-40"
+          >
+            <Eye className="h-4 w-4" />
+          </Button>
+
           <GatedButton
             size="sm"
             canAct={!readOnly}
@@ -763,13 +796,42 @@ export function MessageComposer({
         </div>
       )}
 
-      {/* Hint sits outside the flex row so its height doesn't push
-          `items-end` buttons below the textarea. Indented to line up
-          under the textarea left edge. */}
+      {/* Hint + live formatting status sits outside the flex row so its
+          height doesn't push `items-end` buttons below the textarea. */}
       {!draft && !recording && (
-        <p className="mt-1 pl-[5.5rem] text-[10px] text-muted-foreground">
-          {t("draftHint")}
-        </p>
+        <div className="mt-1 flex flex-wrap items-center justify-between gap-2 pl-[5.5rem] text-[10px] text-muted-foreground">
+          <span>{t("draftHint")}</span>
+          {text.trim().length > 0 && (
+            <div className="flex items-center gap-2">
+              {formattingAnalysis.hasExcessiveBlankLines && (
+                <button
+                  type="button"
+                  onClick={handleOptimizeSpacing}
+                  className="inline-flex items-center gap-1 text-primary hover:underline"
+                >
+                  <Wand2 className="h-3 w-3" />
+                  Clean extra blank lines
+                </button>
+              )}
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1",
+                  formattingAnalysis.likelyTruncated
+                    ? "text-amber-400"
+                    : "text-muted-foreground",
+                )}
+              >
+                {formattingAnalysis.likelyTruncated && (
+                  <AlertTriangle className="h-3 w-3" />
+                )}
+                {formattingAnalysis.charCount} chars
+                {formattingAnalysis.likelyTruncated
+                  ? ' · May trigger "Read more"'
+                  : ""}
+              </span>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Interactive-message builder dialog. */}
@@ -811,6 +873,97 @@ export function MessageComposer({
         onOpenChange={setQuickReplyOpen}
         onPick={handlePickQuickReply}
       />
+
+      {/* Outgoing WhatsApp Message Preview Dialog */}
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent className="border-border bg-popover sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-popover-foreground">
+              <Eye className="h-4 w-4 text-primary" />
+              WhatsApp Message Preview
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="rounded-xl bg-background bg-[url('/inbox-doodle.svg')] p-4">
+              <div className="ml-auto max-w-[90%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm text-primary-foreground shadow-sm">
+                <p className="whitespace-pre-wrap break-words">
+                  {text.trim()}
+                </p>
+                {formattingAnalysis.likelyTruncated && (
+                  <p className="mt-1.5 border-t border-primary-foreground/20 pt-1 text-[11px] font-medium text-primary-foreground/85">
+                    … WhatsApp may show &ldquo;Read more&rdquo; around ~
+                    {WHATSAPP_READ_MORE_CHAR_THRESHOLD} chars
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>
+                {formattingAnalysis.charCount} characters ·{" "}
+                {formattingAnalysis.lineCount} line
+                {formattingAnalysis.lineCount === 1 ? "" : "s"}
+              </span>
+              {formattingAnalysis.likelyTruncated ? (
+                <span className="inline-flex items-center gap-1 text-amber-400">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  May collapse on mobile
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-emerald-400">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Clean preview fit
+                </span>
+              )}
+            </div>
+
+            {formattingAnalysis.tips.length > 0 && (
+              <div className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-300">
+                {formattingAnalysis.tips.map((tip, idx) => (
+                  <p key={idx}>• {tip}</p>
+                ))}
+              </div>
+            )}
+
+            <p className="text-[11px] text-muted-foreground">
+              WhatsApp controls native &ldquo;Read more&rdquo; folding in the
+              recipient&apos;s app. Your complete message is always sent as one
+              message without splitting.
+            </p>
+          </div>
+          <DialogFooter className="gap-2">
+            {formattingAnalysis.hasExcessiveBlankLines && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleOptimizeSpacing}
+                className="mr-auto border-border text-xs"
+              >
+                <Wand2 className="mr-1 h-3.5 w-3.5" />
+                Clean Spacing
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setPreviewOpen(false)}
+              className="border-border"
+            >
+              Edit
+            </Button>
+            <Button
+              type="button"
+              disabled={!text.trim() || sending || sessionExpired}
+              onClick={() => void handleSend()}
+              className="bg-primary text-primary-foreground hover:bg-primary/90"
+            >
+              <Send className="mr-1.5 h-3.5 w-3.5" />
+              {t("send")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

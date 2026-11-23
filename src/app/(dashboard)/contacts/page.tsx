@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import type { Contact, Tag, ContactTag } from '@/types';
@@ -49,6 +50,7 @@ import {
   SlidersHorizontal,
   Filter,
   X,
+  MessageSquare,
 } from 'lucide-react';
 import { ContactForm } from '@/components/contacts/contact-form';
 import { ContactDetailView } from '@/components/contacts/contact-detail-view';
@@ -66,6 +68,7 @@ interface ContactWithTags extends Contact {
 
 export default function ContactsPage() {
   const t = useTranslations('Contacts.page');
+  const router = useRouter();
   const supabase = createClient();
   const canEdit = useCan('send-messages');
   const canEditSettings = useCan('edit-settings');
@@ -242,6 +245,24 @@ export default function ContactsPage() {
   function openDetail(contactId: string) {
     setDetailContactId(contactId);
     setDetailOpen(true);
+  }
+
+  async function openWhatsAppChat(contactId: string) {
+    try {
+      const res = await fetch('/api/whatsapp/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact_id: contactId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.conversation?.id) {
+        toast.error(data?.error || 'Failed to open WhatsApp chat');
+        return;
+      }
+      router.push(`/inbox?c=${data.conversation.id}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to open chat');
+    }
   }
 
   function confirmDelete(contact: Contact) {
@@ -662,6 +683,16 @@ export default function ContactsPage() {
                         align="end"
                         className="bg-popover border-border"
                       >
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void openWhatsAppChat(contact.id);
+                          }}
+                          className="text-popover-foreground focus:bg-muted focus:text-foreground"
+                        >
+                          <MessageSquare className="size-4" />
+                          Open WhatsApp Chat
+                        </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={(e) => {
                             e.stopPropagation();

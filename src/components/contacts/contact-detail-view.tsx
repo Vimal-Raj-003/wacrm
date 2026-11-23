@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { addContactTag, deleteContactTag } from '@/lib/contacts/tag-api';
 import { useAuth } from '@/hooks/use-auth';
@@ -39,6 +40,7 @@ import {
   X,
   DollarSign,
   LayoutTemplate,
+  MessageSquare,
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { contactHandle } from '@/lib/whatsapp/wa-identity';
@@ -58,12 +60,14 @@ export function ContactDetailView({
   onUpdated,
 }: ContactDetailViewProps) {
   const t = useTranslations('Contacts.detailView');
+  const router = useRouter();
   const supabase = createClient();
   const { accountId, defaultCurrency } = useAuth();
 
   const [contact, setContact] = useState<Contact | null>(null);
   const [loading, setLoading] = useState(false);
   const [copiedPhone, setCopiedPhone] = useState(false);
+  const [openingChat, setOpeningChat] = useState(false);
 
   // Send template — lets the business initiate (or re-open) a conversation
   // with this contact by sending an approved template. The send route
@@ -336,6 +340,29 @@ export function ContactDetailView({
     setSavingCustom(false);
   }
 
+  async function handleOpenChat() {
+    if (!contactId || openingChat) return;
+    setOpeningChat(true);
+    try {
+      const res = await fetch('/api/whatsapp/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact_id: contactId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.conversation?.id) {
+        toast.error(data?.error || 'Failed to open WhatsApp chat');
+        return;
+      }
+      onOpenChange(false);
+      router.push(`/inbox?c=${data.conversation.id}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to open chat');
+    } finally {
+      setOpeningChat(false);
+    }
+  }
+
   async function handleSendTemplate(
     template: MessageTemplate,
     values: TemplateSendValues,
@@ -356,6 +383,8 @@ export function ContactDetailView({
           template_message_params: {
             body: values.body,
             headerText: values.headerText,
+            headerMediaUrl: values.headerMediaUrl,
+            headerDocumentFilename: values.headerDocumentFilename,
             buttonParams: values.buttonParams,
           },
           template_params: values.body,
@@ -444,12 +473,26 @@ export function ContactDetailView({
                   </div>
                 </div>
               </div>
-              <div className="mt-3">
+              <div className="mt-3 flex flex-wrap items-center gap-2">
                 <Button
                   size="sm"
+                  onClick={() => void handleOpenChat()}
+                  disabled={openingChat}
+                  className="bg-primary text-primary-foreground hover:bg-primary/90"
+                >
+                  {openingChat ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <MessageSquare className="size-4" />
+                  )}
+                  Open WhatsApp Chat
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
                   onClick={() => setTemplatePickerOpen(true)}
                   disabled={sendingTemplate}
-                  className="bg-primary text-primary-foreground hover:bg-primary/90"
+                  className="border-border text-popover-foreground hover:bg-muted"
                 >
                   {sendingTemplate ? (
                     <Loader2 className="size-4 animate-spin" />
@@ -765,6 +808,7 @@ export function ContactDetailView({
       open={templatePickerOpen}
       onOpenChange={setTemplatePickerOpen}
       onSelect={handleSendTemplate}
+      contact={contact}
     />
     </>
   );

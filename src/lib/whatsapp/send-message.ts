@@ -47,6 +47,10 @@ import {
   templateBodyParams,
   templateContentText,
 } from '@/lib/whatsapp/template-body';
+import {
+  isRetryableMetaError,
+  withTransientRetry,
+} from '@/lib/whatsapp/retry-policy';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -418,7 +422,16 @@ export async function sendMessageToConversation(
 
     for (const variant of variants) {
       try {
-        waMessageId = await attempt(variant);
+        // Automatically retry transient network / 429 / 5xx Meta errors
+        // (up to 2 quick retries) without retrying permanent or
+        // phone-variant errors.
+        waMessageId = await withTransientRetry(() => attempt(variant), {
+          shouldRetry: (err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (isRecipientNotAllowedError(msg)) return false;
+            return isRetryableMetaError(err);
+          },
+        });
         workingPhone = variant;
         lastError = null;
         break;
@@ -473,6 +486,20 @@ export async function sendMessageToConversation(
           )
         : (contentText ?? null);
 
+  // For document/media-header templates, persist the header media URL on
+  // the message row so the sent PDF/media shows cleanly in chat history.
+  const templateHeaderMediaUrl =
+    messageType === 'template' &&
+    templateMessageParams &&
+    typeof templateMessageParams === 'object' &&
+    'headerMediaUrl' in templateMessageParams &&
+    typeof (templateMessageParams as { headerMediaUrl?: unknown }).headerMediaUrl ===
+      'string'
+      ? (templateMessageParams as { headerMediaUrl: string }).headerMediaUrl
+      : messageType === 'template' && templateRow?.header_media_url
+        ? templateRow.header_media_url
+        : null;
+
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
     .insert({
@@ -480,7 +507,7 @@ export async function sendMessageToConversation(
       sender_type: 'agent',
       content_type: messageType,
       content_text: persistedText,
-      media_url: mediaUrl || null,
+      media_url: mediaUrl || templateHeaderMediaUrl || null,
       template_name: templateName || null,
       interactive_payload:
         messageType === 'interactive' ? interactivePayload : null,

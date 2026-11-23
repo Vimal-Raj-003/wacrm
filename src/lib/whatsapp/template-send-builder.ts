@@ -42,6 +42,8 @@ export interface SendTimeParams {
   headerMediaUrl?: string;
   /** Alternative: send the media by Meta media id (from prior upload). */
   headerMediaId?: string;
+  /** Optional filename shown to the recipient for DOCUMENT headers (e.g. "Quote.pdf"). */
+  headerDocumentFilename?: string;
   /**
    * Per-button overrides keyed by the button's index in the
    * template's `buttons` array. Used for URL buttons with a {{1}}
@@ -65,7 +67,7 @@ type MetaSendParameter =
   | { type: 'text'; text: string }
   | { type: 'image'; image: { link?: string; id?: string } }
   | { type: 'video'; video: { link?: string; id?: string } }
-  | { type: 'document'; document: { link?: string; id?: string } }
+  | { type: 'document'; document: { link?: string; id?: string; filename?: string } }
   | { type: 'coupon_code'; coupon_code: string }
   | { type: 'payload'; payload: string };
 
@@ -111,6 +113,10 @@ function buildHeaderComponent(
     );
   }
   const mediaPayload: { link?: string; id?: string } = id ? { id } : { link };
+  const docPayload: { link?: string; id?: string; filename?: string } =
+    params.headerDocumentFilename?.trim()
+      ? { ...mediaPayload, filename: params.headerDocumentFilename.trim() }
+      : mediaPayload;
   return {
     type: 'header',
     parameters: [
@@ -118,7 +124,7 @@ function buildHeaderComponent(
         ? { type: 'image', image: mediaPayload }
         : headerType === 'video'
           ? { type: 'video', video: mediaPayload }
-          : { type: 'document', document: mediaPayload },
+          : { type: 'document', document: docPayload },
     ],
   };
 }

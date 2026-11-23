@@ -11,6 +11,9 @@ import {
   LayoutTemplate,
   CornerDownLeft,
   Sparkles,
+  RotateCcw,
+  Loader2,
+  FileText,
 } from "lucide-react";
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
@@ -38,6 +41,14 @@ interface MessageBubbleProps {
    * stays inline and non-clickable.
    */
   onOpenMedia?: (messageId: string) => void;
+  /** Retry a failed outbound message (manual immediate retry). */
+  onRetry?: (message: Message) => void;
+  /** True while this message is actively being retried. */
+  isRetrying?: boolean;
+  /** True when 24h window blocks retrying a failed non-template message. */
+  retryBlockedByWindow?: boolean;
+  /** Opens the approved template picker when 24h window blocks free-form retry. */
+  onOpenTemplates?: () => void;
 }
 
 /**
@@ -55,24 +66,46 @@ function failureReason(message: Message): string | null {
 function StatusIcon({
   status,
   title,
+  isRetrying,
 }: {
   status: Message["status"];
   /** Tooltip for the failed state — Meta's reason, when we have one. */
   title?: string | null;
+  isRetrying?: boolean;
 }) {
+  if (isRetrying) {
+    return (
+      <span className="inline-flex items-center gap-0.5 text-[10px] text-primary-foreground/85">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Retrying…
+      </span>
+    );
+  }
   switch (status) {
     case "sending":
-      return <Clock className="h-3 w-3 text-muted-foreground" />;
+      return <Clock className="h-3 w-3 text-primary-foreground/70" />;
     case "sent":
-      return <Check className="h-3 w-3 text-muted-foreground" />;
+      return (
+        <span className="inline-flex" title="Sent">
+          <Check className="h-3 w-3 text-primary-foreground/80" />
+        </span>
+      );
     case "delivered":
-      return <CheckCheck className="h-3 w-3 text-muted-foreground" />;
+      return (
+        <span className="inline-flex" title="Delivered">
+          <CheckCheck className="h-3 w-3 text-primary-foreground/80" />
+        </span>
+      );
     case "read":
-      return <CheckCheck className="h-3 w-3 text-blue-400" />;
+      return (
+        <span className="inline-flex" title="Read">
+          <CheckCheck className="h-3 w-3 text-sky-300" />
+        </span>
+      );
     case "failed":
       return (
-        <span className="inline-flex" title={title ?? undefined}>
-          <XCircle className="h-3 w-3 text-red-400" />
+        <span className="inline-flex" title={title ?? "Failed to send"}>
+          <XCircle className="h-3 w-3 text-red-300" />
         </span>
       );
     default:
@@ -174,6 +207,27 @@ function MessageContent({
             <LayoutTemplate className="h-3 w-3" />
             {t("template")}
           </span>
+          {message.media_url && (
+            <a
+              href={message.media_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cn(
+                "mb-1.5 flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs transition-colors",
+                isAgent
+                  ? "bg-primary-foreground/15 text-primary-foreground hover:bg-primary-foreground/25"
+                  : "bg-background/60 text-foreground hover:bg-background",
+              )}
+            >
+              <FileText className="h-4 w-4 shrink-0" />
+              <span className="truncate font-medium">
+                {decodeURIComponent(
+                  message.media_url.split("/").pop()?.split("?")[0] ||
+                    "Attached document",
+                )}
+              </span>
+            </a>
+          )}
           {message.content_text ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
               {message.content_text}
@@ -245,6 +299,10 @@ export function MessageBubble({
   currentUserId,
   onToggleReaction,
   onOpenMedia,
+  onRetry,
+  isRetrying,
+  retryBlockedByWindow,
+  onOpenTemplates,
 }: MessageBubbleProps) {
   const t = useTranslations("Inbox.bubble");
 
@@ -313,16 +371,52 @@ export function MessageBubble({
           >
             {time}
           </span>
-          {isAgent && <StatusIcon status={message.status} title={failure} />}
+          {isAgent && (
+            <StatusIcon
+              status={message.status}
+              title={failure}
+              isRetrying={isRetrying}
+            />
+          )}
         </div>
       </div>
-      {failure && (
-        <p
-          className="mt-0.5 px-1 text-[10px] leading-tight text-muted-foreground"
-          title={failure}
-        >
-          {t("notDelivered")}: {failure}
-        </p>
+      {isAgent && message.status === "failed" && (
+        <div className="mt-1 flex flex-wrap items-center justify-end gap-2 px-1">
+          <p
+            className="text-[10px] leading-tight text-red-400"
+            title={failure ?? undefined}
+          >
+            {failure ? `${t("notDelivered")}: ${failure}` : `${t("notDelivered")}`}
+          </p>
+          {retryBlockedByWindow ? (
+            onOpenTemplates && (
+              <button
+                type="button"
+                onClick={onOpenTemplates}
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400 hover:bg-amber-500/20"
+              >
+                <LayoutTemplate className="h-3 w-3" />
+                Send Template
+              </button>
+            )
+          ) : (
+            onRetry && (
+              <button
+                type="button"
+                disabled={isRetrying}
+                onClick={() => onRetry(message)}
+                className="inline-flex items-center gap-1 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-400 hover:bg-red-500/20 disabled:opacity-50"
+              >
+                {isRetrying ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <RotateCcw className="h-3 w-3" />
+                )}
+                {isRetrying ? "Retrying…" : "Retry"}
+              </button>
+            )
+          )}
+        </div>
       )}
       {reactions && reactions.length > 0 && onToggleReaction && (
         <MessageReactions

@@ -445,13 +445,25 @@ export function TemplateManager() {
     }));
   }
 
-  function addButton() {
+  function addButton(type: TemplateButton['type'] = 'QUICK_REPLY') {
     if (form.buttons.length >= TEMPLATE_LIMITS.maxButtonsTotal) return;
+    if (
+      type === 'URL' &&
+      form.buttons.filter((b) => b.type === 'URL').length >=
+        TEMPLATE_LIMITS.maxUrlButtons
+    ) {
+      toast.error(
+        `Meta WhatsApp Cloud API allows at most ${TEMPLATE_LIMITS.maxUrlButtons} URL buttons per standard template.`,
+      );
+      return;
+    }
     setForm((prev) => ({
       ...prev,
-      buttons: [...prev.buttons, emptyButton('QUICK_REPLY')],
+      buttons: [...prev.buttons, emptyButton(type)],
     }));
   }
+
+  const urlButtonCount = form.buttons.filter((b) => b.type === 'URL').length;
 
   if (loading) {
     return (
@@ -955,20 +967,50 @@ export function TemplateManager() {
             </div>
 
             <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label className="text-muted-foreground">{t('buttons')}</Label>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={addButton}
-                  disabled={form.buttons.length >= TEMPLATE_LIMITS.maxButtonsTotal}
-                  className="border-border bg-transparent text-muted-foreground hover:bg-muted h-7 text-xs"
-                >
-                  <Plus className="size-3" />
-                  {t('addButton')}
-                </Button>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Label className="text-muted-foreground">{t('buttons')}</Label>
+                  <span className="text-[11px] text-muted-foreground">
+                    ({form.buttons.length}/{TEMPLATE_LIMITS.maxButtonsTotal} total ·{' '}
+                    {urlButtonCount}/{TEMPLATE_LIMITS.maxUrlButtons} URL)
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => addButton('URL')}
+                    disabled={
+                      form.buttons.length >= TEMPLATE_LIMITS.maxButtonsTotal ||
+                      urlButtonCount >= TEMPLATE_LIMITS.maxUrlButtons
+                    }
+                    title={`Meta Cloud API allows up to ${TEMPLATE_LIMITS.maxUrlButtons} URL buttons per standard template`}
+                    className="border-border bg-transparent text-muted-foreground hover:bg-muted h-7 text-xs"
+                  >
+                    <Plus className="size-3" />
+                    Add URL Button
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => addButton('QUICK_REPLY')}
+                    disabled={form.buttons.length >= TEMPLATE_LIMITS.maxButtonsTotal}
+                    className="border-border bg-transparent text-muted-foreground hover:bg-muted h-7 text-xs"
+                  >
+                    <Plus className="size-3" />
+                    {t('addButton')}
+                  </Button>
+                </div>
               </div>
+              <p className="text-[11px] text-muted-foreground">
+                Meta WhatsApp Business API supports up to{' '}
+                {TEMPLATE_LIMITS.maxButtonsTotal} total buttons, with a strict
+                platform limit of {TEMPLATE_LIMITS.maxUrlButtons} URL buttons per
+                standard template. For more than {TEMPLATE_LIMITS.maxUrlButtons}{' '}
+                links, include additional URLs in the body text.
+              </p>
               {form.buttons.length === 0 ? (
                 <p className="text-[11px] text-muted-foreground">
                   {t('buttonsLimit', { max: TEMPLATE_LIMITS.maxButtonsTotal })}
