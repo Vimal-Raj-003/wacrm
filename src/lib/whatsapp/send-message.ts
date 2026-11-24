@@ -53,6 +53,7 @@ import {
   isRetryableMetaError,
   withTransientRetry,
 } from '@/lib/whatsapp/retry-policy';
+import { basenameFromUrl, sanitizeFilename } from '@/lib/media/filename';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -92,6 +93,8 @@ export interface SendMessageParams {
   templateMessageParams?: unknown;
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
+  /** Whether WhatsApp should render a link preview card on text messages (defaults to false). */
+  previewUrl?: boolean;
   replyToMessageId?: string | null;
   senderId?: string | null;
 }
@@ -207,6 +210,7 @@ export async function sendMessageToConversation(
     templateParams,
     templateMessageParams,
     interactivePayload,
+    previewUrl,
     replyToMessageId,
   } = params;
 
@@ -363,6 +367,14 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     if (isMediaKind) {
+      const cleanedFilename =
+        messageType === 'document'
+          ? (filename?.trim()
+              ? sanitizeFilename(filename.trim().replace(/^\d{10,}-/, ''))
+              : mediaUrl
+                ? basenameFromUrl(mediaUrl)
+                : '') || undefined
+          : undefined;
       const result = await sendMediaMessage({
         phoneNumberId: config.phone_number_id,
         accessToken,
@@ -370,7 +382,7 @@ export async function sendMessageToConversation(
         kind: messageType as MediaKind,
         link: mediaUrl!,
         caption: contentText || undefined,
-        filename: filename || undefined,
+        filename: cleanedFilename,
         contextMessageId,
       });
       return result.messageId;
@@ -408,6 +420,7 @@ export async function sendMessageToConversation(
       accessToken,
       to: phone,
       text: contentText!,
+      previewUrl: previewUrl ?? false,
       contextMessageId,
     });
     return result.messageId;

@@ -113,8 +113,20 @@ describe('BSUID recipients switch to Meta`s `recipient` field', () => {
     })
     expect(captured).toMatchObject({
       recipient: BSUID,
-      text: { body: 'hi' },
+      text: { preview_url: false, body: 'hi' },
       context: { message_id: 'wamid.PARENT' },
+    })
+  })
+
+  it('honors previewUrl: true when explicitly requested', async () => {
+    await sendTextMessage({
+      ...BASE,
+      to: '15551230000',
+      text: 'Visit https://vimsenterprise.com',
+      previewUrl: true,
+    })
+    expect(captured).toMatchObject({
+      text: { preview_url: true, body: 'Visit https://vimsenterprise.com' },
     })
   })
 })

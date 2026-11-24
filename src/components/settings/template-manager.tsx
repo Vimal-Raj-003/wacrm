@@ -12,6 +12,7 @@ import {
   Pencil,
   RotateCcw,
   Upload,
+  Wand2,
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import {
@@ -59,6 +60,10 @@ import {
   extractVariableIndices,
   TEMPLATE_LIMITS,
 } from '@/lib/whatsapp/template-validators';
+import {
+  analyzeOutgoingMessage,
+  optimizeMessageSpacing,
+} from '@/lib/whatsapp/message-formatting';
 
 const CATEGORIES = ['Marketing', 'Utility', 'Authentication'] as const;
 type HeaderFormat = 'none' | 'text' | 'image' | 'video' | 'document';
@@ -186,6 +191,27 @@ export function TemplateManager() {
         : 0,
     [form.header_format, form.header_content],
   );
+
+  // Live formatting & fold analysis across body + extra body links so agents
+  // catch Marketing 3–5 line folds, Markdown links, and first-URL preview cards
+  // BEFORE submitting to Meta.
+  const templateBodyAnalysis = useMemo(() => {
+    const extraFormatted = extraBodyLinks
+      .filter((l) => l.url.trim().length > 0)
+      .map((l) =>
+        l.title.trim() ? `${l.title.trim()}: ${l.url.trim()}` : l.url.trim(),
+      )
+      .join('\n');
+    const previewBody = extraFormatted
+      ? `${form.body_text.trim()}\n\n${extraFormatted}`
+      : form.body_text;
+    return analyzeOutgoingMessage(previewBody, {
+      context:
+        form.category === 'Marketing' ? 'marketing_template' : 'utility_template',
+      hasMediaHeader:
+        form.header_format !== 'none' && form.header_format !== 'text',
+    });
+  }, [form.body_text, form.category, form.header_format, extraBodyLinks]);
 
   // Resize body_samples so it always has exactly bodyVarCount entries.
   // (We mutate via setForm in an effect so React owns the state.)
@@ -980,6 +1006,43 @@ export function TemplateManager() {
               <p className="text-[11px] text-muted-foreground">
                 {t.raw('bodyHint')}
               </p>
+
+              {form.body_text.trim().length > 0 &&
+                templateBodyAnalysis.tips.length > 0 && (
+                  <div className="space-y-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-300">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium">
+                        WhatsApp Display Check ({templateBodyAnalysis.charCount}{' '}
+                        chars · ~{templateBodyAnalysis.estimatedMobileLines}{' '}
+                        mobile lines)
+                      </span>
+                      {(templateBodyAnalysis.hasMarkdownLinks ||
+                        templateBodyAnalysis.hasExcessiveBlankLines ||
+                        (templateBodyAnalysis.hasGreetingBlankLine &&
+                          templateBodyAnalysis.foldLineLimit <= 5)) && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              body_text: optimizeMessageSpacing(prev.body_text, {
+                                compactGreeting:
+                                  templateBodyAnalysis.foldLineLimit <= 5,
+                              }),
+                            }))
+                          }
+                          className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-background/60 px-2 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-background"
+                        >
+                          <Wand2 className="h-3 w-3" />
+                          Fix formatting
+                        </button>
+                      )}
+                    </div>
+                    {templateBodyAnalysis.tips.map((tip, idx) => (
+                      <p key={idx}>• {tip}</p>
+                    ))}
+                  </div>
+                )}
 
               {bodyVarCount > 0 && (
                 <div className="space-y-1.5 pt-1">

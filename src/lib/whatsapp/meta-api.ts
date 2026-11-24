@@ -574,6 +574,12 @@ export interface SendTextMessageArgs {
   accessToken: string
   to: string
   text: string
+  /**
+   * Whether WhatsApp should render a rich link-preview card for the first URL
+   * in the message body. Defaults to `false` so multi-link messages do not get
+   * hijacked by a single preview card or truncated earlier behind "Read more".
+   */
+  previewUrl?: boolean
   /** Meta's message_id of the message being replied to. Adds a `context` field
    *  so WhatsApp renders the new message as a reply with a quote preview. */
   contextMessageId?: string
@@ -586,13 +592,13 @@ export interface SendTextMessageArgs {
 export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
-  const { phoneNumberId, accessToken, to, text, contextMessageId } = args
+  const { phoneNumberId, accessToken, to, text, previewUrl = false, contextMessageId } = args
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     ...recipientFields(to),
     type: 'text',
-    text: { body: text },
+    text: { preview_url: previewUrl, body: text },
   }
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }

@@ -132,6 +132,28 @@ describe('buildSendComponents — header', () => {
     });
   });
 
+  it('auto-strips storage epoch timestamp prefix from document header URLs', () => {
+    const components = buildSendComponents(
+      row({
+        header_type: 'document',
+        header_media_url:
+          'https://cdn.example.com/storage/v1/object/public/chat-media/account-1/1795426206867-VIMS_Enterprise_Brochure.pdf',
+      }),
+    );
+    expect(components[0]).toEqual({
+      type: 'header',
+      parameters: [
+        {
+          type: 'document',
+          document: {
+            link: 'https://cdn.example.com/storage/v1/object/public/chat-media/account-1/1795426206867-VIMS_Enterprise_Brochure.pdf',
+            filename: 'VIMS_Enterprise_Brochure.pdf',
+          },
+        },
+      ],
+    });
+  });
+
   it('uses an explicit headerMediaId override as the media id', () => {
     const components = buildSendComponents(
       row({ header_type: 'image', header_media_url: 'https://x.com/s.jpg' }),

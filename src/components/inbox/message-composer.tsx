@@ -29,6 +29,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Wand2,
+  Link2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { GatedButton } from "@/components/ui/gated-button";
@@ -75,8 +76,8 @@ import { QuickReplyPicker } from "./quick-reply-picker";
 import {
   analyzeOutgoingMessage,
   optimizeMessageSpacing,
-  WHATSAPP_READ_MORE_CHAR_THRESHOLD,
 } from "@/lib/whatsapp/message-formatting";
+import { basenameFromUrl } from "@/lib/media/filename";
 
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
@@ -135,7 +136,7 @@ interface MessageComposerProps {
   conversationId: string;
   contact?: Contact | null;
   sessionExpired: boolean;
-  onSend: (text: string, replyToId?: string) => void;
+  onSend: (text: string, replyToId?: string, options?: { previewUrl?: boolean }) => void;
   onSendMedia: (payload: SendMediaPayload) => void;
   onSendInteractive: (payload: InteractiveMessagePayload, replyToId?: string) => void;
   onSendTemplate?: (template: MessageTemplate, values: TemplateSendValues) => void;
@@ -231,6 +232,9 @@ export function MessageComposer({
   // Pre-send message preview dialog — lets agents check WhatsApp fold
   // risk ("Read more") and formatting before sending.
   const [previewOpen, setPreviewOpen] = useState(false);
+  // Link preview card toggle for free-form text messages (defaults OFF so
+  // multi-link messages do not show a single preview card or fold earlier).
+  const [previewUrl, setPreviewUrl] = useState(false);
 
   // Media attachment state. `draft` holds an uploaded-but-not-yet-sent
   // attachment; `busy` covers the upload/transcode window.
@@ -375,11 +379,16 @@ export function MessageComposer({
           body: bodyValues,
           ...(activeQuickTemplate.header_type === "document" &&
           activeQuickTemplate.header_media_url
-            ? { headerMediaUrl: activeQuickTemplate.header_media_url }
+            ? {
+                headerMediaUrl: activeQuickTemplate.header_media_url,
+                headerDocumentFilename:
+                  basenameFromUrl(activeQuickTemplate.header_media_url) ||
+                  "Document.pdf",
+              }
             : {}),
         });
       } else {
-        onSend(trimmed, replyTo?.id);
+        onSend(trimmed, replyTo?.id, { previewUrl });
       }
       setText("");
       setPreviewOpen(false);
@@ -399,14 +408,40 @@ export function MessageComposer({
     contact?.name,
     onSend,
     replyTo?.id,
+    previewUrl,
   ]);
 
-  const formattingAnalysis = analyzeOutgoingMessage(text);
+  const activeMessageContext =
+    sessionExpired && activeQuickTemplate
+      ? activeQuickTemplate.category === "Marketing"
+        ? "marketing_template"
+        : "utility_template"
+      : "text";
+
+  const formattingAnalysis = analyzeOutgoingMessage(text, {
+    context: activeMessageContext,
+    hasMediaHeader: Boolean(
+      sessionExpired &&
+        activeQuickTemplate?.header_type &&
+        activeQuickTemplate.header_type !== "text",
+    ),
+    previewUrl,
+  });
+
+  const needsFormattingFix =
+    formattingAnalysis.hasExcessiveBlankLines ||
+    formattingAnalysis.hasMarkdownLinks ||
+    (formattingAnalysis.hasGreetingBlankLine &&
+      formattingAnalysis.foldLineLimit <= 5);
 
   const handleOptimizeSpacing = useCallback(() => {
-    setText((prev) => optimizeMessageSpacing(prev));
+    setText((prev) =>
+      optimizeMessageSpacing(prev, {
+        compactGreeting: formattingAnalysis.foldLineLimit <= 5,
+      }),
+    );
     requestAnimationFrame(() => adjustHeight());
-  }, [adjustHeight]);
+  }, [adjustHeight, formattingAnalysis.foldLineLimit]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1046,31 +1081,58 @@ export function MessageComposer({
         <div className="mt-1 flex flex-wrap items-center justify-between gap-2 pl-1 text-[10px] text-muted-foreground sm:pl-[5.5rem]">
           <span>{t("draftHint")}</span>
           {text.trim().length > 0 && (
-            <div className="flex items-center gap-2">
-              {formattingAnalysis.hasExcessiveBlankLines && (
+            <div className="flex flex-wrap items-center gap-2">
+              {!sessionExpired && formattingAnalysis.urls.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setPreviewUrl((prev) => !prev)}
+                  title={
+                    previewUrl
+                      ? "Link preview card is ON (WhatsApp will preview only the first link and may fold earlier). Click to turn OFF."
+                      : "Link preview card is OFF so multiple links display cleanly without a large preview card. Click to turn ON."
+                  }
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors",
+                    previewUrl
+                      ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                      : "border-border bg-muted/60 text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Link2 className="h-2.5 w-2.5" />
+                  Link preview: {previewUrl ? "On" : "Off"}
+                </button>
+              )}
+              {needsFormattingFix && (
                 <button
                   type="button"
                   onClick={handleOptimizeSpacing}
                   className="inline-flex items-center gap-1 text-primary hover:underline"
                 >
                   <Wand2 className="h-3 w-3" />
-                  Clean extra blank lines
+                  {formattingAnalysis.hasMarkdownLinks
+                    ? "Fix Markdown links & spacing"
+                    : "Fix spacing"}
                 </button>
               )}
               <span
                 className={cn(
                   "inline-flex items-center gap-1",
-                  formattingAnalysis.likelyTruncated
+                  formattingAnalysis.likelyTruncated ||
+                    formattingAnalysis.hasMarkdownLinks ||
+                    formattingAnalysis.multiLinkPreviewRisk
                     ? "text-amber-400"
                     : "text-muted-foreground",
                 )}
               >
-                {formattingAnalysis.likelyTruncated && (
+                {(formattingAnalysis.likelyTruncated ||
+                  formattingAnalysis.hasMarkdownLinks ||
+                  formattingAnalysis.multiLinkPreviewRisk) && (
                   <AlertTriangle className="h-3 w-3" />
                 )}
-                {formattingAnalysis.charCount} chars
+                {formattingAnalysis.charCount} chars · ~
+                {formattingAnalysis.estimatedMobileLines} lines
                 {formattingAnalysis.likelyTruncated
-                  ? ' · May trigger "Read more"'
+                  ? ` · May fold after ~${formattingAnalysis.foldLineLimit} lines`
                   : ""}
               </span>
             </div>
@@ -1136,7 +1198,7 @@ export function MessageComposer({
                 {formattingAnalysis.likelyTruncated && (
                   <p className="mt-1.5 border-t border-primary-foreground/20 pt-1 text-[11px] font-medium text-primary-foreground/85">
                     … WhatsApp may show &ldquo;Read more&rdquo; around ~
-                    {WHATSAPP_READ_MORE_CHAR_THRESHOLD} chars
+                    {formattingAnalysis.foldLineLimit} mobile lines
                   </p>
                 )}
               </div>
@@ -1144,9 +1206,9 @@ export function MessageComposer({
 
             <div className="flex items-center justify-between text-xs text-muted-foreground">
               <span>
-                {formattingAnalysis.charCount} characters ·{" "}
-                {formattingAnalysis.lineCount} line
-                {formattingAnalysis.lineCount === 1 ? "" : "s"}
+                {formattingAnalysis.charCount} chars · ~
+                {formattingAnalysis.estimatedMobileLines} mobile line
+                {formattingAnalysis.estimatedMobileLines === 1 ? "" : "s"}
               </span>
               {formattingAnalysis.likelyTruncated ? (
                 <span className="inline-flex items-center gap-1 text-amber-400">
@@ -1176,7 +1238,7 @@ export function MessageComposer({
             </p>
           </div>
           <DialogFooter className="gap-2">
-            {formattingAnalysis.hasExcessiveBlankLines && (
+            {needsFormattingFix && (
               <Button
                 type="button"
                 variant="outline"
@@ -1185,7 +1247,7 @@ export function MessageComposer({
                 className="mr-auto border-border text-xs"
               >
                 <Wand2 className="mr-1 h-3.5 w-3.5" />
-                Clean Spacing
+                Fix Formatting
               </Button>
             )}
             <Button
@@ -1236,6 +1298,10 @@ function MediaDraftPreview({
   t: ReturnType<typeof useTranslations>;
 }) {
   const tGate = useTranslations("GatedButton");
+  const captionAnalysis =
+    draft.kind !== "audio" && draft.caption.trim().length > 0
+      ? analyzeOutgoingMessage(draft.caption, { context: "media_caption" })
+      : null;
   return (
     <div className="rounded-xl border border-border bg-muted/40 p-3">
       <div className="flex items-start gap-3">
@@ -1301,6 +1367,31 @@ function MediaDraftPreview({
           <Send className="h-4 w-4" />
         </GatedButton>
       </div>
+      {captionAnalysis &&
+        (captionAnalysis.likelyTruncated || captionAnalysis.hasMarkdownLinks) && (
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300">
+            <span className="flex items-center gap-1.5">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              {captionAnalysis.hasMarkdownLinks
+                ? 'Markdown [text](url) links render literally in WhatsApp.'
+                : 'WhatsApp folds document/media captions after ~3 lines — keep captions short or send full details as a text message.'}
+            </span>
+            {captionAnalysis.hasMarkdownLinks && (
+              <button
+                type="button"
+                onClick={() =>
+                  onCaptionChange(
+                    optimizeMessageSpacing(draft.caption, { compactGreeting: true }),
+                  )
+                }
+                className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
+              >
+                <Wand2 className="h-3 w-3" />
+                Fix links
+              </button>
+            )}
+          </div>
+        )}
     </div>
   );
 }

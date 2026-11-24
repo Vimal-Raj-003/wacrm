@@ -43,6 +43,7 @@ import {
   MEDIA_MAX_BYTES_BY_KIND,
 } from "@/lib/storage/upload-media";
 import { analyzeOutgoingMessage } from "@/lib/whatsapp/message-formatting";
+import { basenameFromUrl } from "@/lib/media/filename";
 import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 
@@ -71,13 +72,7 @@ function renderBodyPreview(body: string, params: string[]): string {
 }
 
 function filenameFromUrl(url: string): string {
-  try {
-    const pathname = new URL(url).pathname;
-    const last = decodeURIComponent(pathname.split("/").pop() || "");
-    return last || "Document.pdf";
-  } catch {
-    return "Document.pdf";
-  }
+  return basenameFromUrl(url) || "Document.pdf";
 }
 
 interface UrlButtonSlot {
@@ -316,8 +311,15 @@ export function TemplatePicker({
   );
 
   const previewAnalysis = useMemo(
-    () => analyzeOutgoingMessage(renderedPreview),
-    [renderedPreview],
+    () =>
+      analyzeOutgoingMessage(renderedPreview, {
+        context:
+          selected?.category === "Marketing"
+            ? "marketing_template"
+            : "utility_template",
+        hasMediaHeader: Boolean(slots?.mediaHeaderKind),
+      }),
+    [renderedPreview, selected?.category, slots?.mediaHeaderKind],
   );
 
   const contactQuickFills = useMemo(() => {
@@ -517,14 +519,14 @@ export function TemplatePicker({
                 </div>
               )}
 
-              {previewAnalysis.likelyTruncated && (
-                <div className="mt-2 flex items-start gap-1.5 rounded bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-400">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>
-                    Long template output may be folded behind WhatsApp&apos;s
-                    native &ldquo;Read more&rdquo; button. Keep variable values
-                    concise.
-                  </span>
+              {previewAnalysis.tips.length > 0 && (
+                <div className="mt-2 space-y-1 rounded bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-400">
+                  {previewAnalysis.tips.map((tip, idx) => (
+                    <div key={idx} className="flex items-start gap-1.5">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>{tip}</span>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

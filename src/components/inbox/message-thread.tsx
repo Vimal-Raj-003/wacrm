@@ -592,7 +592,7 @@ export function MessageThread({
   }, [messages]);
 
   const handleSend = useCallback(
-    async (text: string, replyToId?: string) => {
+    async (text: string, replyToId?: string, options?: { previewUrl?: boolean }) => {
       if (!conversation) return;
 
       const tempId = newTempMessageId();
@@ -615,6 +615,7 @@ export function MessageThread({
         conversation_id: conversation.id,
         message_type: "text",
         content_text: text,
+        preview_url: options?.previewUrl ?? false,
         reply_to_message_id: replyToId,
       };
 

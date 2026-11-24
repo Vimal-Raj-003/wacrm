@@ -29,6 +29,7 @@ import {
   withTransientRetry,
 } from '@/lib/whatsapp/retry-policy';
 import { MEDIA_KINDS } from '@/lib/whatsapp/send-message';
+import { basenameFromUrl } from '@/lib/media/filename';
 import type { InteractiveMessagePayload, MessageTemplate } from '@/types';
 
 /**
@@ -274,12 +275,8 @@ export async function POST(request: Request) {
     );
 
     const filenameFromUrl = (url: string): string | undefined => {
-      try {
-        const seg = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
-        return seg || undefined;
-      } catch {
-        return undefined;
-      }
+      const cleaned = basenameFromUrl(url);
+      return cleaned || undefined;
     };
 
     const attempt = async (target: string): Promise<string> => {
@@ -307,6 +304,13 @@ export async function POST(request: Request) {
       }
 
       if (isMediaKind && msg.media_url) {
+        const docFilename =
+          msg.content_type === 'document'
+            ? filenameFromUrl(msg.media_url) ||
+              (msg.content_text && /\.[A-Za-z0-9]{1,8}$/.test(msg.content_text.trim())
+                ? msg.content_text.trim()
+                : undefined)
+            : undefined;
         const res = await sendMediaMessage({
           phoneNumberId: config.phone_number_id,
           accessToken,
@@ -317,10 +321,7 @@ export async function POST(request: Request) {
             msg.content_type === 'audio'
               ? undefined
               : msg.content_text || undefined,
-          filename:
-            msg.content_type === 'document'
-              ? msg.content_text || undefined
-              : undefined,
+          filename: docFilename,
           contextMessageId,
         });
         return res.messageId;
@@ -360,6 +361,7 @@ export async function POST(request: Request) {
         accessToken,
         to: target,
         text: msg.content_text || '',
+        previewUrl: false,
         contextMessageId,
       });
       return res.messageId;

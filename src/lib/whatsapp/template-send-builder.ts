@@ -39,6 +39,7 @@ import {
   extractVariableIndices,
   isNamedVariable,
 } from './template-validators';
+import { basenameFromUrl, sanitizeFilename } from '@/lib/media/filename';
 import { getT } from '@/lib/i18n/translate';
 
 const t = getT('Validation.templates');
@@ -126,9 +127,22 @@ function buildHeaderComponent(
     );
   }
   const mediaPayload: { link?: string; id?: string } = id ? { id } : { link };
+  const cleanedExplicitFilename = params.headerDocumentFilename?.trim()
+    ? sanitizeFilename(params.headerDocumentFilename.trim().replace(/^\d{10,}-/, ''))
+    : '';
+  // If no explicit filename was provided for a document header stored under a
+  // timestamp-prefixed object path (e.g. `1795426206867-Brochure.pdf`), supply
+  // the clean filename to Meta so recipients never see the storage timestamp.
+  const hasTimestampedUrlSegment =
+    headerType === 'document' &&
+    typeof link === 'string' &&
+    /\/\d{10,}-[^/?#]+(?:[?#]|$)/.test(link);
+  const resolvedDocFilename =
+    cleanedExplicitFilename ||
+    (hasTimestampedUrlSegment && link ? basenameFromUrl(link) : '');
   const docPayload: { link?: string; id?: string; filename?: string } =
-    params.headerDocumentFilename?.trim()
-      ? { ...mediaPayload, filename: params.headerDocumentFilename.trim() }
+    resolvedDocFilename
+      ? { ...mediaPayload, filename: resolvedDocFilename }
       : mediaPayload;
   return {
     type: 'header',

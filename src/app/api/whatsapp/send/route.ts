@@ -61,6 +61,7 @@ export async function POST(request: Request) {
       template_params,
       template_message_params,
       interactive_payload,
+      preview_url,
       reply_to_message_id,
     } = body
 
@@ -168,6 +169,7 @@ export async function POST(request: Request) {
         templateParams: template_params,
         templateMessageParams: template_message_params,
         interactivePayload: interactive_payload,
+        previewUrl: preview_url === true,
         replyToMessageId: reply_to_message_id,
         senderId: userId,
       })
