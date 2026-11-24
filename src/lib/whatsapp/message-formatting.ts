@@ -262,3 +262,103 @@ export function optimizeMessageSpacing(
 
   return cleaned;
 }
+
+/**
+ * Splits a message into clean, sequential short bubbles so that EVERY bubble
+ * stays within WhatsApp Android's 4-line / ~175-char visible window and
+ * NEVER collapses behind a "Read more" button.
+ *
+ * - Cleans Markdown `[label](url)` links and wasted blank lines after greetings.
+ * - Keeps URLs intact (never splits a URL in half).
+ * - Splits naturally on paragraphs, then lines, then sentences, then spaces.
+ * - Returns a single-element array when the message already fits cleanly.
+ */
+export function splitForNoReadMore(
+  text: string,
+  options: { maxLines?: number; maxChars?: number } = {},
+): string[] {
+  const maxLines = options.maxLines ?? 4;
+  const maxChars = options.maxChars ?? 175;
+
+  const cleaned = optimizeMessageSpacing(text, { compactGreeting: true });
+  if (!cleaned) return [];
+
+  const fits = (candidate: string): boolean =>
+    candidate.length <= maxChars && estimateMobileLines(candidate) <= maxLines;
+
+  if (fits(cleaned)) return [cleaned];
+
+  // Break into natural atomic units (lines, then sentences/words for oversized lines).
+  const rawLines = cleaned.split('\n');
+  const units: string[] = [];
+
+  for (const rawLine of rawLines) {
+    const line = rawLine.trim();
+    if (!line) {
+      // Preserve paragraph boundary marker without wasting a blank line inside a tight bubble.
+      if (units.length > 0 && units[units.length - 1] !== '') {
+        units.push('');
+      }
+      continue;
+    }
+
+    if (fits(line)) {
+      units.push(line);
+      continue;
+    }
+
+    // Split a single long line by sentence boundaries first, then by word boundaries
+    // (keeping URLs atomic because URLs contain no spaces).
+    const sentences = line.split(/(?<=[.!?])\s+(?=\S)/);
+    for (const sentence of sentences) {
+      if (fits(sentence)) {
+        units.push(sentence);
+      } else {
+        const words = sentence.split(/\s+/);
+        let current = '';
+        for (const word of words) {
+          const next = current ? `${current} ${word}` : word;
+          if (current && !fits(next)) {
+            units.push(current);
+            current = word;
+          } else {
+            current = next;
+          }
+        }
+        if (current) units.push(current);
+      }
+    }
+  }
+
+  // Pack units into sequential bubbles that each fit strictly under the fold threshold.
+  const bubbles: string[] = [];
+  let current = '';
+
+  for (const unit of units) {
+    if (unit === '') {
+      // Paragraph break: flush current bubble if it already has 2+ visual lines
+      // so the next paragraph starts cleanly in a fresh bubble without blank-line waste.
+      if (current && estimateMobileLines(current) >= 2) {
+        bubbles.push(current);
+        current = '';
+      }
+      continue;
+    }
+
+    if (!current) {
+      current = unit;
+      continue;
+    }
+
+    const joined = `${current}\n${unit}`;
+    if (fits(joined)) {
+      current = joined;
+    } else {
+      bubbles.push(current);
+      current = unit;
+    }
+  }
+
+  if (current) bubbles.push(current);
+  return bubbles;
+}

@@ -61,6 +61,7 @@ import {
 } from "@/lib/whatsapp/template-message-view";
 import { contactHandle } from "@/lib/whatsapp/wa-identity";
 import { isOutside24HourWindowError } from "@/lib/whatsapp/retry-policy";
+import { splitForNoReadMore } from "@/lib/whatsapp/message-formatting";
 import { resolveAssignmentResult } from "@/lib/inbox/assignment";
 import {
   businessReactionOn,
@@ -592,66 +593,83 @@ export function MessageThread({
   }, [messages]);
 
   const handleSend = useCallback(
-    async (text: string, replyToId?: string, options?: { previewUrl?: boolean }) => {
+    async (
+      text: string,
+      replyToId?: string,
+      options?: { previewUrl?: boolean; noReadMore?: boolean },
+    ) => {
       if (!conversation) return;
 
-      const tempId = newTempMessageId();
-
-      // Optimistic update — shows the message immediately with "sending" status
-      const optimisticMsg: Message = {
-        id: tempId,
-        conversation_id: conversation.id,
-        sender_type: "agent",
-        content_type: "text",
-        content_text: text,
-        status: "sending",
-        created_at: new Date().toISOString(),
-        reply_to_message_id: replyToId,
-      };
-      onNewMessage(optimisticMsg);
+      const chunks = options?.noReadMore ? splitForNoReadMore(text) : [text];
+      if (chunks.length === 0) return;
       setReplyTo(null);
 
-      const requestBody: Record<string, unknown> = {
-        conversation_id: conversation.id,
-        message_type: "text",
-        content_text: text,
-        preview_url: options?.previewUrl ?? false,
-        reply_to_message_id: replyToId,
-      };
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkText = chunks[i];
+        const chunkReplyToId = i === 0 ? replyToId : undefined;
+        const tempId = newTempMessageId();
 
-      try {
-        const res = await fetch("/api/whatsapp/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requestBody),
-        });
+        // Optimistic update — shows the message immediately with "sending" status
+        const optimisticMsg: Message = {
+          id: tempId,
+          conversation_id: conversation.id,
+          sender_type: "agent",
+          content_type: "text",
+          content_text: chunkText,
+          status: "sending",
+          created_at: new Date().toISOString(),
+          reply_to_message_id: chunkReplyToId,
+        };
+        onNewMessage(optimisticMsg);
 
-        const payload = await res.json().catch(() => ({}));
+        const requestBody: Record<string, unknown> = {
+          conversation_id: conversation.id,
+          message_type: "text",
+          content_text: chunkText,
+          preview_url: options?.previewUrl ?? false,
+          reply_to_message_id: chunkReplyToId,
+        };
 
-        if (!res.ok) {
-          const reason = payload?.error || `HTTP ${res.status}`;
-          console.error("Failed to send message:", reason);
+        try {
+          const res = await fetch("/api/whatsapp/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+          });
+
+          const payload = await res.json().catch(() => ({}));
+
+          if (!res.ok) {
+            const reason = payload?.error || `HTTP ${res.status}`;
+            console.error("Failed to send message:", reason);
+            toast.error(t("sendFailed", { reason }));
+            retryPayloadsRef.current.set(tempId, requestBody);
+            // Mark the optimistic bubble as failed so the user sees what happened
+            onUpdateMessage(tempId, { status: "failed", error_title: reason });
+            return;
+          }
+
+          retryPayloadsRef.current.delete(tempId);
+          // Success — the realtime INSERT event will replace the temp bubble
+          // with the real DB row. If realtime hasn't arrived yet, at least
+          // flip status to 'sent' so the UI stops showing "sending".
+          onUpdateMessage(tempId, {
+            ...confirmedSendUpdate(payload),
+            error_title: null,
+          });
+
+          // Brief pause between sequential bubbles so WhatsApp preserves exact order.
+          if (i < chunks.length - 1) {
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        } catch (err) {
+          console.error("Failed to send message:", err);
+          const reason = err instanceof Error ? err.message : t("networkError");
           toast.error(t("sendFailed", { reason }));
           retryPayloadsRef.current.set(tempId, requestBody);
-          // Mark the optimistic bubble as failed so the user sees what happened
           onUpdateMessage(tempId, { status: "failed", error_title: reason });
           return;
         }
-
-        retryPayloadsRef.current.delete(tempId);
-        // Success — the realtime INSERT event will replace the temp bubble
-        // with the real DB row. If realtime hasn't arrived yet, at least
-        // flip status to 'sent' so the UI stops showing "sending".
-        onUpdateMessage(tempId, {
-          ...confirmedSendUpdate(payload),
-          error_title: null,
-        });
-      } catch (err) {
-        console.error("Failed to send message:", err);
-        const reason = err instanceof Error ? err.message : t("networkError");
-        toast.error(t("sendFailed", { reason }));
-        retryPayloadsRef.current.set(tempId, requestBody);
-        onUpdateMessage(tempId, { status: "failed", error_title: reason });
       }
     },
     [conversation, onNewMessage, onUpdateMessage, t]
@@ -661,13 +679,19 @@ export function MessageThread({
     async (payload: SendMediaPayload) => {
       if (!conversation) return;
 
-      // Documents show their filename in our own bubble (and to the
-      // recipient as the Meta caption when no caption was typed); other
-      // kinds use the caption as-is. Audio carries no caption.
+      // When No "Read more" mode separates a long caption, send the PDF/media
+      // cleanly with NO caption (using filename only for our own document bubble
+      // preview) and follow immediately with crisp <=4-line text bubbles.
+      const followUpCaption =
+        payload.separateLongCaption && payload.kind !== "audio" && payload.caption
+          ? payload.caption
+          : undefined;
+      const attachedCaption = followUpCaption ? undefined : payload.caption;
+
       const contentText =
         payload.kind === "document"
-          ? payload.caption || payload.filename || t("documentFallback")
-          : payload.caption;
+          ? attachedCaption || payload.filename || t("documentFallback")
+          : attachedCaption;
 
       const tempId = newTempMessageId();
       const optimisticMsg: Message = {
@@ -688,7 +712,7 @@ export function MessageThread({
         conversation_id: conversation.id,
         message_type: payload.kind,
         media_url: payload.mediaUrl,
-        content_text: contentText,
+        content_text: followUpCaption ? undefined : contentText,
         filename: payload.filename,
         reply_to_message_id: payload.replyToId,
       };
@@ -718,6 +742,14 @@ export function MessageThread({
           ...confirmedSendUpdate(data),
           error_title: null,
         });
+
+        if (followUpCaption) {
+          await new Promise((r) => setTimeout(r, 250));
+          await handleSend(followUpCaption, undefined, {
+            previewUrl: false,
+            noReadMore: true,
+          });
+        }
       } catch (err) {
         console.error("Failed to send media:", err);
         const reason = err instanceof Error ? err.message : t("networkError");
@@ -726,7 +758,7 @@ export function MessageThread({
         onUpdateMessage(tempId, { status: "failed", error_title: reason });
       }
     },
-    [conversation, onNewMessage, onUpdateMessage, t],
+    [conversation, onNewMessage, onUpdateMessage, handleSend, t],
   );
 
   const handleSendInteractive = useCallback(

@@ -17,6 +17,7 @@ import {
   Image as ImageIcon,
   Video,
   FileText,
+  FileAudio,
   Mic,
   Square,
   X,
@@ -75,7 +76,9 @@ import {
 import { QuickReplyPicker } from "./quick-reply-picker";
 import {
   analyzeOutgoingMessage,
+  estimateMobileLines,
   optimizeMessageSpacing,
+  splitForNoReadMore,
 } from "@/lib/whatsapp/message-formatting";
 import { basenameFromUrl } from "@/lib/media/filename";
 
@@ -102,6 +105,12 @@ export interface SendMediaPayload {
   caption?: string;
   /** Original file name — surfaced to the recipient for documents. */
   filename?: string;
+  /**
+   * When true and caption exceeds 2 mobile lines, send the attachment cleanly
+   * without a long caption and follow up with short <=4-line text bubbles so
+   * WhatsApp never collapses the text behind "Read more".
+   */
+  separateLongCaption?: boolean;
   replyToId?: string;
 }
 
@@ -116,12 +125,52 @@ interface ReplyDraft {
 // the file picker so unsupported files are rejected before upload rather
 // than failing with a confusing Storage error. Audio has no picker — it's
 // captured via the recorder.
-const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
+const PICKER_ACCEPT: Record<"image" | "video" | "document" | "audio", string> = {
   image: "image/png,image/jpeg,image/webp",
   video: "video/mp4,video/3gpp",
   document:
     "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain",
+  audio:
+    "audio/mpeg,audio/ogg,audio/mp4,audio/aac,audio/amr,.mp3,.ogg,.m4a,.aac,.amr",
 };
+
+const AUDIO_MIME_BY_EXT: Record<string, string> = {
+  mp3: "audio/mpeg",
+  ogg: "audio/ogg",
+  opus: "audio/ogg",
+  m4a: "audio/mp4",
+  mp4: "audio/mp4",
+  aac: "audio/aac",
+  amr: "audio/amr",
+};
+
+const ALLOWED_AUDIO_MIMES = new Set([
+  "audio/ogg",
+  "audio/mpeg",
+  "audio/aac",
+  "audio/mp4",
+  "audio/amr",
+]);
+
+/**
+ * Windows/macOS browsers often report non-canonical MIME types for audio files
+ * (e.g. `audio/x-m4a`, `audio/mp3`, or empty string). Normalize to the exact
+ * MIME types allowed by the `chat-media` Supabase bucket and Meta Cloud API.
+ */
+function normalizeAudioFile(file: File): File {
+  const lowerType = (file.type || "").toLowerCase().split(";")[0].trim();
+  if (ALLOWED_AUDIO_MIMES.has(lowerType)) return file;
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  const canonical =
+    AUDIO_MIME_BY_EXT[ext] ??
+    (lowerType === "audio/x-m4a"
+      ? "audio/mp4"
+      : lowerType === "audio/mp3"
+        ? "audio/mpeg"
+        : "");
+  if (!canonical) return file;
+  return new File([file], file.name, { type: canonical });
+}
 
 interface MediaDraft {
   kind: ComposerMediaKind;
@@ -136,7 +185,11 @@ interface MessageComposerProps {
   conversationId: string;
   contact?: Contact | null;
   sessionExpired: boolean;
-  onSend: (text: string, replyToId?: string, options?: { previewUrl?: boolean }) => void;
+  onSend: (
+    text: string,
+    replyToId?: string,
+    options?: { previewUrl?: boolean; noReadMore?: boolean },
+  ) => void;
   onSendMedia: (payload: SendMediaPayload) => void;
   onSendInteractive: (payload: InteractiveMessagePayload, replyToId?: string) => void;
   onSendTemplate?: (template: MessageTemplate, values: TemplateSendValues) => void;
@@ -146,6 +199,7 @@ interface MessageComposerProps {
 }
 
 const QUICK_START_TEMPLATE_KEY = "wacrm:quick-start-template";
+const NO_READ_MORE_KEY = "wacrm:no-read-more-mode";
 
 /**
  * Approved templates eligible for WhatsApp-style direct typing when a
@@ -235,6 +289,29 @@ export function MessageComposer({
   // Link preview card toggle for free-form text messages (defaults OFF so
   // multi-link messages do not show a single preview card or fold earlier).
   const [previewUrl, setPreviewUrl] = useState(false);
+  // "No 'Read more' mode" — automatically sends long free-form messages in
+  // clean sequential <=4-line bubbles (and separates long PDF captions) so
+  // WhatsApp Android renders 100% of the message without any "Read more" fold.
+  const [noReadMoreMode, setNoReadMoreMode] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    try {
+      const saved = localStorage.getItem(NO_READ_MORE_KEY);
+      return saved === null ? true : saved === "true";
+    } catch {
+      return true;
+    }
+  });
+  const toggleNoReadMore = useCallback(() => {
+    setNoReadMoreMode((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(NO_READ_MORE_KEY, String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
 
   // Media attachment state. `draft` holds an uploaded-but-not-yet-sent
   // attachment; `busy` covers the upload/transcode window.
@@ -243,6 +320,10 @@ export function MessageComposer({
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const documentInputRef = useRef<HTMLInputElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
+  // When true, stopping an active voice recording sends it immediately instead
+  // of staging it in the preview bar first.
+  const autoSendRecordingRef = useRef(false);
   // Mirror of `draft` for the unmount cleanup, which can't read render
   // state. Kept in sync below so navigating away with a staged-but-unsent
   // attachment GCs the orphaned object.
@@ -388,7 +469,7 @@ export function MessageComposer({
             : {}),
         });
       } else {
-        onSend(trimmed, replyTo?.id, { previewUrl });
+        onSend(trimmed, replyTo?.id, { previewUrl, noReadMore: noReadMoreMode });
       }
       setText("");
       setPreviewOpen(false);
@@ -409,6 +490,7 @@ export function MessageComposer({
     onSend,
     replyTo?.id,
     previewUrl,
+    noReadMoreMode,
   ]);
 
   const activeMessageContext =
@@ -590,7 +672,8 @@ export function MessageComposer({
 
   // Upload a captured file to chat-media and stage it as a draft.
   const stageUpload = useCallback(
-    async (kind: ComposerMediaKind, file: File) => {
+    async (kind: ComposerMediaKind, rawFile: File) => {
+      const file = kind === "audio" ? normalizeAudioFile(rawFile) : rawFile;
       // Per-kind ceiling mirrors Meta's caps (image 5 MB, etc.) so we
       // reject before upload rather than orphaning an object that Meta
       // would then refuse at send.
@@ -621,7 +704,7 @@ export function MessageComposer({
   );
 
   const handlePicked = useCallback(
-    (kind: "image" | "video" | "document", file: File | undefined) => {
+    (kind: "image" | "video" | "document" | "audio", file: File | undefined) => {
       if (file) void stageUpload(kind, file);
     },
     [stageUpload],
@@ -630,9 +713,12 @@ export function MessageComposer({
   // ---- Voice recording (client-side Ogg/Opus, no server transcode) ---
 
   // The encoded Ogg/Opus file from opus-recorder → upload as an audio
-  // draft. WhatsApp renders Ogg/Opus as a playable voice note.
+  // draft (or send immediately when Stop & Send was clicked). WhatsApp
+  // renders Ogg/Opus as a playable voice note.
   const finalizeRecording = useCallback(
     async (bytes: Uint8Array) => {
+      const shouldSendNow = autoSendRecordingRef.current;
+      autoSendRecordingRef.current = false;
       // Uint8Array is a valid BlobPart at runtime; the cast sidesteps the
       // lib.dom ArrayBufferLike-vs-ArrayBuffer generic mismatch.
       const file = new File([bytes as unknown as BlobPart], `voice-${Date.now()}.ogg`, {
@@ -646,19 +732,35 @@ export function MessageComposer({
       setBusy(true);
       try {
         const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        removeStaged(draftRef.current?.path);
-        setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
+        if (shouldSendNow) {
+          onSendMedia({
+            kind: "audio",
+            mediaUrl: publicUrl,
+            path,
+            replyToId: replyTo?.id,
+          });
+          onClearReply?.();
+        } else {
+          removeStaged(draftRef.current?.path);
+          setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
+        }
       } catch (err) {
         toast.error(err instanceof Error ? err.message : t("uploadFailed"));
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged, t],
+    [removeStaged, onSendMedia, replyTo?.id, onClearReply, t],
   );
 
   const startRecording = useCallback(async () => {
-    if (inputsDisabled || busy || recording) return;
+    if (readOnly || busy || recording) return;
+    if (sessionExpired) {
+      toast.error(
+        "Voice notes and audio files require an active 24-hour chat. Send an approved template first — once the customer replies, you can record and send audio.",
+      );
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
       toast.error(t("recordingUnsupported"));
       return;
@@ -675,6 +777,7 @@ export function MessageComposer({
         streamPages: false, // one callback with the complete file on stop
       });
       cancelledRef.current = false;
+      autoSendRecordingRef.current = false;
       recorder.ondataavailable = (bytes) => {
         if (cancelledRef.current) return;
         void finalizeRecording(bytes);
@@ -689,9 +792,17 @@ export function MessageComposer({
       recorderRef.current = null;
       toast.error(t("microphoneDenied"));
     }
-  }, [inputsDisabled, busy, recording, finalizeRecording, t]);
+  }, [readOnly, sessionExpired, busy, recording, finalizeRecording, t]);
 
   const stopRecording = useCallback(() => {
+    autoSendRecordingRef.current = false;
+    clearTimer();
+    setRecording(false);
+    void recorderRef.current?.stop().catch(() => {});
+  }, [clearTimer]);
+
+  const stopAndSendRecording = useCallback(() => {
+    autoSendRecordingRef.current = true;
     clearTimer();
     setRecording(false);
     void recorderRef.current?.stop().catch(() => {});
@@ -738,15 +849,22 @@ export function MessageComposer({
       onClearReply?.();
       return;
     }
+    const trimmedCaption =
+      draft.kind === "audio" ? undefined : draft.caption.trim() || undefined;
+    const separateLongCaption = Boolean(
+      noReadMoreMode &&
+        trimmedCaption &&
+        (estimateMobileLines(trimmedCaption) > 2 || trimmedCaption.length > 85),
+    );
     onSendMedia({
       kind: draft.kind,
       mediaUrl: draft.mediaUrl,
       path: draft.path,
       // Audio takes no caption (Meta rejects it). Everything else: the
       // trimmed caption, or undefined when blank.
-      caption:
-        draft.kind === "audio" ? undefined : draft.caption.trim() || undefined,
+      caption: trimmedCaption,
       filename: draft.kind === "document" ? draft.filename : undefined,
+      separateLongCaption,
       replyToId: replyTo?.id,
     });
     // The object is now owned by the sent message — clear without GC.
@@ -760,6 +878,7 @@ export function MessageComposer({
     onSendTemplate,
     contact?.name,
     onSendMedia,
+    noReadMoreMode,
     replyTo?.id,
     onClearReply,
   ]);
@@ -880,12 +999,23 @@ export function MessageComposer({
           e.target.value = "";
         }}
       />
+      <input
+        ref={audioInputRef}
+        type="file"
+        accept={PICKER_ACCEPT.audio}
+        className="hidden"
+        onChange={(e) => {
+          handlePicked("audio", e.target.files?.[0]);
+          e.target.value = "";
+        }}
+      />
 
       {draft ? (
         <MediaDraftPreview
           draft={draft}
           busy={busy}
           readOnly={readOnly}
+          noReadMoreMode={noReadMoreMode}
           onCaptionChange={setCaption}
           onDiscard={discardDraft}
           onSend={sendDraft}
@@ -893,25 +1023,38 @@ export function MessageComposer({
         />
       ) : recording ? (
         // Recording bar — replaces the composer while the mic is live.
-        <div className="flex items-center gap-3 rounded-xl border border-border bg-muted px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-2.5">
           <span className="flex h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
-          <span className="flex-1 text-sm text-foreground">
+          <span className="flex-1 text-sm font-medium text-foreground">
             {t("recording", { current: formatDuration(recordSeconds), max: formatDuration(MAX_RECORDING_SECONDS) })}
           </span>
           <button
             type="button"
             onClick={cancelRecording}
-            className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-card hover:text-foreground"
+            className="rounded-md px-2.5 py-1 text-xs text-muted-foreground hover:bg-card hover:text-foreground"
           >
             {t("cancel")}
           </button>
           <Button
+            type="button"
+            variant="outline"
             size="sm"
             onClick={stopRecording}
-            className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90"
+            className="h-8 gap-1 border-border px-2.5 text-xs"
             title={t("stopAndAttach")}
           >
-            <Square className="h-4 w-4" />
+            <Square className="h-3.5 w-3.5" />
+            Preview
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={stopAndSendRecording}
+            className="h-8 gap-1 bg-primary px-3 text-xs text-primary-foreground hover:bg-primary/90"
+            title="Stop recording and send voice note immediately"
+          >
+            <Send className="h-3.5 w-3.5" />
+            Send Voice
           </Button>
         </div>
       ) : (
@@ -957,10 +1100,16 @@ export function MessageComposer({
                 {t("document")}
               </DropdownMenuItem>
               {!sessionExpired && (
-                <DropdownMenuItem onClick={() => void startRecording()}>
-                  <Mic className="mr-2 h-4 w-4" />
-                  {t("voiceNote")}
-                </DropdownMenuItem>
+                <>
+                  <DropdownMenuItem onClick={() => audioInputRef.current?.click()}>
+                    <FileAudio className="mr-2 h-4 w-4" />
+                    Audio File (.mp3 / .ogg / .m4a)
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void startRecording()}>
+                    <Mic className="mr-2 h-4 w-4" />
+                    {t("voiceNote")}
+                  </DropdownMenuItem>
+                </>
               )}
             </DropdownMenuContent>
           </DropdownMenu>
@@ -1062,6 +1211,31 @@ export function MessageComposer({
             <Eye className="h-4 w-4" />
           </Button>
 
+          {/* Direct WhatsApp-style Microphone button — always visible for 1-click voice recording */}
+          <GatedButton
+            type="button"
+            variant="ghost"
+            size="sm"
+            canAct={!readOnly}
+            gateReason={tGate("reasons.sendMessages")}
+            disabled={busy || recording}
+            onClick={() => void startRecording()}
+            title={
+              sessionExpired
+                ? "Record voice note (requires active 24h chat)"
+                : "Record & send voice note"
+            }
+            aria-label="Record voice note"
+            className={cn(
+              "order-1 h-9 w-9 shrink-0 p-0 sm:order-3",
+              sessionExpired
+                ? "text-muted-foreground/50 hover:text-muted-foreground"
+                : "text-muted-foreground hover:bg-primary/10 hover:text-primary",
+            )}
+          >
+            <Mic className="h-4 w-4" />
+          </GatedButton>
+
           <GatedButton
             size="sm"
             canAct={!readOnly}
@@ -1079,7 +1253,29 @@ export function MessageComposer({
           height doesn't push `items-end` buttons below the textarea. */}
       {!draft && !recording && (
         <div className="mt-1 flex flex-wrap items-center justify-between gap-2 pl-1 text-[10px] text-muted-foreground sm:pl-[5.5rem]">
-          <span>{t("draftHint")}</span>
+          <div className="flex flex-wrap items-center gap-2">
+            {!sessionExpired && (
+              <button
+                type="button"
+                onClick={toggleNoReadMore}
+                title={
+                  noReadMoreMode
+                    ? 'No "Read more" mode is ON — long messages and long PDF captions automatically send in crisp <=4-line bubbles so 100% of text is visible without "Read more". Click to turn OFF.'
+                    : 'No "Read more" mode is OFF — messages send as one single bubble (WhatsApp may fold >4 lines behind "Read more"). Click to turn ON.'
+                }
+                className={cn(
+                  "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium transition-colors",
+                  noReadMoreMode
+                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-400"
+                    : "border-border bg-muted/60 text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <CheckCircle2 className="h-2.5 w-2.5" />
+                No &ldquo;Read more&rdquo;: {noReadMoreMode ? "ON" : "OFF"}
+              </button>
+            )}
+            <span>{t("draftHint")}</span>
+          </div>
           {text.trim().length > 0 && (
             <div className="flex flex-wrap items-center gap-2">
               {!sessionExpired && formattingAnalysis.urls.length > 0 && (
@@ -1114,27 +1310,37 @@ export function MessageComposer({
                     : "Fix spacing"}
                 </button>
               )}
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1",
-                  formattingAnalysis.likelyTruncated ||
+              {!sessionExpired && noReadMoreMode ? (
+                <span className="inline-flex items-center gap-1 text-emerald-400">
+                  <CheckCircle2 className="h-3 w-3" />
+                  {formattingAnalysis.charCount} chars ·{" "}
+                  {splitForNoReadMore(text).length === 1
+                    ? "1 clean bubble (no Read more)"
+                    : `${splitForNoReadMore(text).length} clean bubbles (no Read more)`}
+                </span>
+              ) : (
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1",
+                    formattingAnalysis.likelyTruncated ||
+                      formattingAnalysis.hasMarkdownLinks ||
+                      formattingAnalysis.multiLinkPreviewRisk
+                      ? "text-amber-400"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {(formattingAnalysis.likelyTruncated ||
                     formattingAnalysis.hasMarkdownLinks ||
-                    formattingAnalysis.multiLinkPreviewRisk
-                    ? "text-amber-400"
-                    : "text-muted-foreground",
-                )}
-              >
-                {(formattingAnalysis.likelyTruncated ||
-                  formattingAnalysis.hasMarkdownLinks ||
-                  formattingAnalysis.multiLinkPreviewRisk) && (
-                  <AlertTriangle className="h-3 w-3" />
-                )}
-                {formattingAnalysis.charCount} chars · ~
-                {formattingAnalysis.estimatedMobileLines} lines
-                {formattingAnalysis.likelyTruncated
-                  ? ` · May fold after ~${formattingAnalysis.foldLineLimit} lines`
-                  : ""}
-              </span>
+                    formattingAnalysis.multiLinkPreviewRisk) && (
+                    <AlertTriangle className="h-3 w-3" />
+                  )}
+                  {formattingAnalysis.charCount} chars · ~
+                  {formattingAnalysis.estimatedMobileLines} lines
+                  {formattingAnalysis.likelyTruncated
+                    ? ` · May fold after ~${formattingAnalysis.foldLineLimit} lines`
+                    : ""}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -1190,18 +1396,34 @@ export function MessageComposer({
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
-            <div className="rounded-xl bg-background bg-[url('/inbox-doodle.svg')] p-4">
-              <div className="ml-auto max-w-[90%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm text-primary-foreground shadow-sm">
-                <p className="whitespace-pre-wrap break-words">
-                  {text.trim()}
-                </p>
-                {formattingAnalysis.likelyTruncated && (
-                  <p className="mt-1.5 border-t border-primary-foreground/20 pt-1 text-[11px] font-medium text-primary-foreground/85">
-                    … WhatsApp may show &ldquo;Read more&rdquo; around ~
-                    {formattingAnalysis.foldLineLimit} mobile lines
+            <div className="max-h-[45vh] space-y-2 overflow-y-auto rounded-xl bg-background bg-[url('/inbox-doodle.svg')] p-4">
+              {!sessionExpired && noReadMoreMode ? (
+                splitForNoReadMore(text).map((bubble, idx, all) => (
+                  <div
+                    key={idx}
+                    className="ml-auto max-w-[90%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-sm text-primary-foreground shadow-sm"
+                  >
+                    <p className="whitespace-pre-wrap break-words">{bubble}</p>
+                    {all.length > 1 && (
+                      <p className="mt-1 text-right text-[10px] text-primary-foreground/75">
+                        Part {idx + 1}/{all.length} · Full text visible
+                      </p>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="ml-auto max-w-[90%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm text-primary-foreground shadow-sm">
+                  <p className="whitespace-pre-wrap break-words">
+                    {text.trim()}
                   </p>
-                )}
-              </div>
+                  {formattingAnalysis.likelyTruncated && (
+                    <p className="mt-1.5 border-t border-primary-foreground/20 pt-1 text-[11px] font-medium text-primary-foreground/85">
+                      … WhatsApp may show &ldquo;Read more&rdquo; around ~
+                      {formattingAnalysis.foldLineLimit} mobile lines
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -1210,7 +1432,13 @@ export function MessageComposer({
                 {formattingAnalysis.estimatedMobileLines} mobile line
                 {formattingAnalysis.estimatedMobileLines === 1 ? "" : "s"}
               </span>
-              {formattingAnalysis.likelyTruncated ? (
+              {!sessionExpired && noReadMoreMode ? (
+                <span className="inline-flex items-center gap-1 text-emerald-400">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Zero &ldquo;Read more&rdquo; ({splitForNoReadMore(text).length} bubble
+                  {splitForNoReadMore(text).length === 1 ? "" : "s"})
+                </span>
+              ) : formattingAnalysis.likelyTruncated ? (
                 <span className="inline-flex items-center gap-1 text-amber-400">
                   <AlertTriangle className="h-3.5 w-3.5" />
                   May collapse on mobile
@@ -1223,7 +1451,7 @@ export function MessageComposer({
               )}
             </div>
 
-            {formattingAnalysis.tips.length > 0 && (
+            {(!noReadMoreMode || sessionExpired) && formattingAnalysis.tips.length > 0 && (
               <div className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-300">
                 {formattingAnalysis.tips.map((tip, idx) => (
                   <p key={idx}>• {tip}</p>
@@ -1232,9 +1460,9 @@ export function MessageComposer({
             )}
 
             <p className="text-[11px] text-muted-foreground">
-              WhatsApp controls native &ldquo;Read more&rdquo; folding in the
-              recipient&apos;s app. Your complete message is always sent as one
-              message without splitting.
+              {!sessionExpired && noReadMoreMode
+                ? 'No "Read more" mode sends each part in <=4 mobile lines with link previews disabled so your customer sees every word immediately.'
+                : 'WhatsApp controls native "Read more" folding on messages over ~4–5 lines. Enable No "Read more" mode to show 100% of text without folding.'}
             </p>
           </div>
           <DialogFooter className="gap-2">
@@ -1284,6 +1512,7 @@ function MediaDraftPreview({
   draft,
   busy,
   readOnly,
+  noReadMoreMode,
   onCaptionChange,
   onDiscard,
   onSend,
@@ -1292,6 +1521,7 @@ function MediaDraftPreview({
   draft: MediaDraft;
   busy: boolean;
   readOnly: boolean;
+  noReadMoreMode: boolean;
   onCaptionChange: (caption: string) => void;
   onDiscard: () => void;
   onSend: () => void;
@@ -1302,6 +1532,13 @@ function MediaDraftPreview({
     draft.kind !== "audio" && draft.caption.trim().length > 0
       ? analyzeOutgoingMessage(draft.caption, { context: "media_caption" })
       : null;
+  const willSeparateCaption = Boolean(
+    noReadMoreMode &&
+      draft.kind !== "audio" &&
+      draft.caption.trim().length > 0 &&
+      (estimateMobileLines(draft.caption.trim()) > 2 ||
+        draft.caption.trim().length > 85),
+  );
   return (
     <div className="rounded-xl border border-border bg-muted/40 p-3">
       <div className="flex items-start gap-3">
@@ -1318,7 +1555,13 @@ function MediaDraftPreview({
             <video src={draft.mediaUrl} controls className="max-h-40 rounded-lg" />
           )}
           {draft.kind === "audio" && (
-            <audio src={draft.mediaUrl} controls className="w-full" />
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <FileAudio className="h-4 w-4 shrink-0 text-primary" />
+                <span className="truncate">{draft.filename}</span>
+              </div>
+              <audio src={draft.mediaUrl} controls className="w-full" />
+            </div>
           )}
           {draft.kind === "document" && (
             <div className="flex items-center gap-2 text-sm text-foreground">
@@ -1367,31 +1610,39 @@ function MediaDraftPreview({
           <Send className="h-4 w-4" />
         </GatedButton>
       </div>
-      {captionAnalysis &&
-        (captionAnalysis.likelyTruncated || captionAnalysis.hasMarkdownLinks) && (
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300">
-            <span className="flex items-center gap-1.5">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              {captionAnalysis.hasMarkdownLinks
-                ? 'Markdown [text](url) links render literally in WhatsApp.'
-                : 'WhatsApp folds document/media captions after ~3 lines — keep captions short or send full details as a text message.'}
-            </span>
-            {captionAnalysis.hasMarkdownLinks && (
-              <button
-                type="button"
-                onClick={() =>
-                  onCaptionChange(
-                    optimizeMessageSpacing(draft.caption, { compactGreeting: true }),
-                  )
-                }
-                className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
-              >
-                <Wand2 className="h-3 w-3" />
-                Fix links
-              </button>
-            )}
-          </div>
-        )}
+      {willSeparateCaption ? (
+        <div className="mt-2 flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-[11px] text-emerald-400">
+          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            No &ldquo;Read more&rdquo; mode: attachment will send cleanly first,
+            followed immediately by your full message in short visible bubbles.
+          </span>
+        </div>
+      ) : captionAnalysis &&
+        (captionAnalysis.likelyTruncated || captionAnalysis.hasMarkdownLinks) ? (
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300">
+          <span className="flex items-center gap-1.5">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            {captionAnalysis.hasMarkdownLinks
+              ? 'Markdown [text](url) links render literally in WhatsApp.'
+              : 'WhatsApp folds document/media captions after ~3 lines — keep captions short or enable No "Read more" mode.'}
+          </span>
+          {captionAnalysis.hasMarkdownLinks && (
+            <button
+              type="button"
+              onClick={() =>
+                onCaptionChange(
+                  optimizeMessageSpacing(draft.caption, { compactGreeting: true }),
+                )
+              }
+              className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
+            >
+              <Wand2 className="h-3 w-3" />
+              Fix links
+            </button>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

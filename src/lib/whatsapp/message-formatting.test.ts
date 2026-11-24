@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   analyzeOutgoingMessage,
   convertMarkdownLinks,
+  estimateMobileLines,
   extractUrls,
   optimizeMessageSpacing,
+  splitForNoReadMore,
   WHATSAPP_READ_MORE_CHAR_THRESHOLD,
 } from './message-formatting';
 
@@ -104,5 +106,40 @@ describe('optimizeMessageSpacing', () => {
         compactGreeting: true,
       }),
     ).toBe('Hello Sir,\nPlease find attached our brochure.');
+  });
+});
+
+describe('splitForNoReadMore', () => {
+  it('keeps short messages as a single bubble', () => {
+    const bubbles = splitForNoReadMore('Hello Sir,\nHere is our brochure.');
+    expect(bubbles).toEqual(['Hello Sir,\nHere is our brochure.']);
+  });
+
+  it('splits a long multi-demo message into <=4-line bubbles without breaking URLs', () => {
+    const longMessage = [
+      'Hello Sir,',
+      '',
+      "Following our conversation, we're sharing four demo websites for your reference. We have developed tailored designs across industries:",
+      '',
+      '1. Biryani Therapy: https://biriyanitherapy.jilljill.in',
+      '2. Demo Store: https://store.vimsenterprise.com',
+      '3. Corporate Site: https://corp.vimsenterprise.com',
+      '4. Portfolio: https://portfolio.vimsenterprise.com',
+      '',
+      'Best regards,',
+      'Team VIMS Enterprise',
+      '[vimsenterprise.com](https://vimsenterprise.com/)',
+    ].join('\n');
+
+    const bubbles = splitForNoReadMore(longMessage);
+    expect(bubbles.length).toBeGreaterThan(1);
+    for (const bubble of bubbles) {
+      expect(estimateMobileLines(bubble)).toBeLessThanOrEqual(4);
+      expect(bubble.length).toBeLessThanOrEqual(175);
+      expect(bubble).not.toContain('](');
+    }
+    const joined = bubbles.join('\n');
+    expect(joined).toContain('https://biriyanitherapy.jilljill.in');
+    expect(joined).toContain('https://vimsenterprise.com/');
   });
 });
