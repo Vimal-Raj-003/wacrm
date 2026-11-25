@@ -50,6 +50,7 @@ const TEMPLATE_WEBHOOK_FIELDS = new Set([
   'message_template_status_update',
   'message_template_quality_update',
   'message_template_components_update',
+  'template_category_update',
 ])
 
 export function isTemplateWebhookField(field: string): boolean {
@@ -76,6 +77,15 @@ interface TemplateComponentsUpdateValue {
   message_template_id?: string | number
   message_template_name?: string
   message_template_language?: string
+}
+
+interface TemplateCategoryUpdateValue {
+  message_template_id?: string | number
+  message_template_name?: string
+  message_template_language?: string
+  previous_category?: string
+  new_category?: string
+  correct_category?: string
 }
 
 export interface TemplateWebhookChange {
@@ -128,6 +138,49 @@ export async function handleTemplateWebhookChange(
         change.value as TemplateComponentsUpdateValue,
       )
       return
+    case 'template_category_update':
+      await handleCategoryUpdate(
+        change.value as TemplateCategoryUpdateValue,
+        supabase,
+      )
+      return
+  }
+}
+
+function normalizeWebhookCategory(
+  raw: string | undefined,
+): 'Marketing' | 'Utility' | 'Authentication' | null {
+  if (!raw) return null
+  const upper = raw.toUpperCase()
+  if (upper === 'UTILITY') return 'Utility'
+  if (upper === 'MARKETING') return 'Marketing'
+  if (upper === 'AUTHENTICATION') return 'Authentication'
+  return null
+}
+
+async function handleCategoryUpdate(
+  value: TemplateCategoryUpdateValue,
+  supabase: SupabaseClient,
+): Promise<void> {
+  const metaTemplateId =
+    value.message_template_id !== undefined
+      ? String(value.message_template_id)
+      : null
+  const nextCategory = normalizeWebhookCategory(
+    value.new_category ?? value.correct_category,
+  )
+  if (!metaTemplateId || !nextCategory) return
+
+  const { error } = await supabase
+    .from('message_templates')
+    .update({ category: nextCategory })
+    .eq('meta_template_id', metaTemplateId)
+
+  if (error) {
+    console.error(
+      `[template-webhook] category update failed for ${metaTemplateId}:`,
+      error.message,
+    )
   }
 }
 

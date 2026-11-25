@@ -189,4 +189,28 @@ describe('POST /api/whatsapp/templates/submit', () => {
     expect(writes[0].kind).toBe('insert')
     expect(writes[0].row).toMatchObject({ status: 'DRAFT', user_id: 'user-1' })
   })
+
+  it('persists Meta-reclassified category when Meta overrides requested Utility category', async () => {
+    vi.stubEnv('WHATSAPP_TEMPLATES_DRY_RUN', 'false')
+    submitMessageTemplate.mockResolvedValue({
+      id: 'meta-55',
+      status: 'APPROVED',
+      category: 'MARKETING',
+    })
+
+    const res = await submit()
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      success: true,
+      reclassified_from: 'Utility',
+    })
+    expect(writes).toHaveLength(1)
+    expect(writes[0].row).toMatchObject({
+      meta_template_id: 'meta-55',
+      category: 'Marketing',
+      status: 'APPROVED',
+    })
+  })
 })

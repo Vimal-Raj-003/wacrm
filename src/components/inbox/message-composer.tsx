@@ -293,12 +293,12 @@ export function MessageComposer({
   // clean sequential <=4-line bubbles (and separates long PDF captions) so
   // WhatsApp Android renders 100% of the message without any "Read more" fold.
   const [noReadMoreMode, setNoReadMoreMode] = useState<boolean>(() => {
-    if (typeof window === "undefined") return true;
+    if (typeof window === "undefined") return false;
     try {
       const saved = localStorage.getItem(NO_READ_MORE_KEY);
-      return saved === null ? true : saved === "true";
+      return saved === null ? false : saved === "true";
     } catch {
-      return true;
+      return false;
     }
   });
   const toggleNoReadMore = useCallback(() => {

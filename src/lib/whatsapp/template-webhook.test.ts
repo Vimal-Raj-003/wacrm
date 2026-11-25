@@ -96,12 +96,13 @@ function makeSupabaseStub(
 }
 
 describe('isTemplateWebhookField', () => {
-  it('recognises the three template fields', () => {
+  it('recognises the template webhook fields', () => {
     expect(isTemplateWebhookField('message_template_status_update')).toBe(true);
     expect(isTemplateWebhookField('message_template_quality_update')).toBe(true);
     expect(isTemplateWebhookField('message_template_components_update')).toBe(
       true,
     );
+    expect(isTemplateWebhookField('template_category_update')).toBe(true);
   });
   it('rejects messaging fields', () => {
     expect(isTemplateWebhookField('messages')).toBe(false);
@@ -567,6 +568,28 @@ describe('handleTemplateWebhookChange — components update', () => {
     );
     expect(calls).toHaveLength(0);
     expect(info).toHaveBeenCalled();
+  });
+});
+
+describe('handleTemplateWebhookChange — category update', () => {
+  it('updates local template category when Meta reclassifies it', async () => {
+    const { stub, calls } = makeSupabaseStub();
+    await handleTemplateWebhookChange(
+      {
+        field: 'template_category_update',
+        value: {
+          message_template_id: '777',
+          previous_category: 'UTILITY',
+          new_category: 'MARKETING',
+        },
+      },
+      stub,
+    );
+    expect(calls[0].update).toEqual({ category: 'Marketing' });
+    expect(calls[0].filter).toEqual({
+      column: 'meta_template_id',
+      value: '777',
+    });
   });
 });
 

@@ -20,6 +20,18 @@ import { getT } from '@/lib/i18n/translate'
 
 const t = getT('Api')
 
+function normalizeMetaCategory(
+  meta: string | undefined,
+  fallback: TemplatePayload['category'],
+): TemplatePayload['category'] {
+  if (!meta) return fallback
+  const upper = meta.toUpperCase()
+  if (upper === 'UTILITY') return 'Utility'
+  if (upper === 'MARKETING') return 'Marketing'
+  if (upper === 'AUTHENTICATION') return 'Authentication'
+  return fallback
+}
+
 function buildTemplateRow(
   accountId: string,
   payload: TemplatePayload,
@@ -27,6 +39,7 @@ function buildTemplateRow(
     status: 'DRAFT' | string
     metaTemplateId: string | null
     submissionError: string | null
+    categoryOverride?: TemplatePayload['category']
   },
 ) {
   return {
@@ -35,7 +48,7 @@ function buildTemplateRow(
     // not-null constraint.
     account_id: accountId,
     name: payload.name,
-    category: payload.category,
+    category: extras.categoryOverride ?? payload.category,
     language: payload.language,
     header_type: payload.header_type ?? null,
     header_content: payload.header_content ?? null,
@@ -183,6 +196,7 @@ export async function POST(request: Request) {
 
     let metaTemplateId: string
     let metaStatus: string
+    let metaCategory: TemplatePayload['category'] = payload.category
 
     if (dryRun) {
       metaTemplateId = `dry-run-${crypto.randomUUID()}`
@@ -237,6 +251,7 @@ export async function POST(request: Request) {
         })
         metaTemplateId = meta.id
         metaStatus = meta.status
+        metaCategory = normalizeMetaCategory(meta.category, payload.category)
       } catch (e) {
         const message = e instanceof Error ? e.message : t('templates.metaSubmitFailed')
         // Persist the failure so the user can retry; row stays DRAFT
@@ -271,6 +286,7 @@ export async function POST(request: Request) {
         status: normalizeStatus(metaStatus),
         metaTemplateId,
         submissionError: null,
+        categoryOverride: metaCategory,
       }),
     )
 
@@ -290,6 +306,8 @@ export async function POST(request: Request) {
     return NextResponse.json({
       success: true,
       template: row,
+      reclassified_from:
+        metaCategory !== payload.category ? payload.category : undefined,
       dry_run: dryRun,
     })
   } catch (error) {

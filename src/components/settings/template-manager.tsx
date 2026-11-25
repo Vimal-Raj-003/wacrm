@@ -338,6 +338,14 @@ export function TemplateManager() {
     setDialogOpen(true);
   }
 
+  const hasUtilityPromoWording = useMemo(() => {
+    if (form.category !== 'Utility') return false;
+    const text = `${form.header_format === 'text' ? form.header_content : ''} ${form.body_text}`;
+    return /\b(brochure|customize|customi[sz]e|services we offer|brand|business needs|discount|offer|promo|sale|demo websites?|explore different)\b/i.test(
+      text,
+    );
+  }, [form.category, form.header_format, form.header_content, form.body_text]);
+
   async function handleSubmit() {
     // AUTHENTICATION is blocked by the persistent banner + disabled
     // submit button; this is a defensive second line of defense.
@@ -371,6 +379,16 @@ export function TemplateManager() {
             ? t('toastSubmitEditSuccess')
             : t('toastSubmitNewSuccess'),
       );
+      if (
+        data.reclassified_from &&
+        data.template?.category &&
+        data.reclassified_from !== data.template.category
+      ) {
+        toast.error(
+          `Meta reclassified this template from ${data.reclassified_from} to ${data.template.category} due to promotional wording. WhatsApp folds Marketing templates at 3–4 lines.`,
+          { duration: 12000 },
+        );
+      }
       setDialogOpen(false);
       setForm(emptyForm);
       setEditingId(null);
@@ -1008,7 +1026,7 @@ export function TemplateManager() {
               </p>
 
               {form.body_text.trim().length > 0 &&
-                templateBodyAnalysis.tips.length > 0 && (
+                (templateBodyAnalysis.tips.length > 0 || hasUtilityPromoWording) && (
                   <div className="space-y-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-300">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-medium">
@@ -1038,6 +1056,14 @@ export function TemplateManager() {
                         </button>
                       )}
                     </div>
+                    {hasUtilityPromoWording && (
+                      <p>
+                        • Contains promotional wording that Meta usually
+                        auto-reclassifies to Marketing (which folds at 3–4
+                        lines). Use factual inquiry/request-update wording to
+                        keep Utility approval.
+                      </p>
+                    )}
                     {templateBodyAnalysis.tips.map((tip, idx) => (
                       <p key={idx}>• {tip}</p>
                     ))}
